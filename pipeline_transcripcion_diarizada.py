@@ -37,10 +37,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--language", default="es")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument(
+        "--transcription-engine",
+        choices=("faster-whisper", "mlx"),
+        default="faster-whisper",
+        help=(
+            "faster-whisper (CTranslate2, CUDA/CPU) o mlx (Metal, solo Apple Silicon). "
+            "Con --transcription-engine mlx, --whisper-model debe ser un repo de HF con pesos MLX "
+            "en formato weights.npz o weights.safetensors (ej. mlx-community/whisper-large-v3-mlx; "
+            "NO uses variantes que empaquetan model.safetensors, como -fp16 u -8bit, no son compatibles "
+            "con el loader de mlx_whisper 0.4.3)."
+        ),
+    )
     parser.add_argument("--whisper-model", default="large-v3")
     parser.add_argument(
         "--pyannote-model",
         default="pyannote/speaker-diarization-community-1",
+    )
+    parser.add_argument(
+        "--diarization-engine",
+        choices=("pyannote", "soniqo"),
+        default="pyannote",
+        help=(
+            "pyannote (pyannote-audio/PyTorch, CUDA/CPU) o soniqo (CLI 'speech diarize --engine community1' "
+            "vía CoreML/Neural Engine, solo Apple Silicon; requiere 'brew install speech')."
+        ),
     )
     parser.add_argument("--models-dir", type=Path)
     parser.add_argument("--beam-size", type=int, default=1)
@@ -186,8 +207,16 @@ def main() -> int:
     args = parse_args()
     package_root = Path(__file__).resolve().parent
     scripts_root = package_root / "scripts_originales"
-    transcriber = scripts_root / "transcribir.py"
-    diarizer = scripts_root / "diarizar.py"
+    transcriber = (
+        scripts_root / "transcribir_mlx.py"
+        if args.transcription_engine == "mlx"
+        else scripts_root / "transcribir.py"
+    )
+    diarizer = (
+        scripts_root / "diarizar_soniqo.py"
+        if args.diarization_engine == "soniqo"
+        else scripts_root / "diarizar.py"
+    )
     for required in (transcriber, diarizer):
         if not required.is_file():
             raise FileNotFoundError(f"Falta un script del paquete: {required}")
@@ -212,67 +241,104 @@ def main() -> int:
     batch_size = args.batch_size if args.device == "cuda" else 0
 
     if not args.skip_transcription:
-        command = [
-            sys.executable,
-            str(transcriber),
-            "--input",
-            str(audio_root),
-            "--file-list",
-            str(file_list),
-            "--output",
-            str(transcript_root),
-            "--model",
-            args.whisper_model,
-            "--model-dir",
-            str(models_dir / "whisper"),
-            "--device",
-            args.device,
-            "--compute-type",
-            compute_type,
-            "--language",
-            args.language,
-            "--beam-size",
-            str(args.beam_size),
-            "--batch-size",
-            str(batch_size),
-            "--word-timestamps",
-        ]
+        if args.transcription_engine == "mlx":
+            command = [
+                sys.executable,
+                str(transcriber),
+                "--input",
+                str(audio_root),
+                "--file-list",
+                str(file_list),
+                "--output",
+                str(transcript_root),
+                "--model",
+                args.whisper_model,
+                "--language",
+                args.language,
+                "--beam-size",
+                str(args.beam_size),
+                "--word-timestamps",
+            ]
+            label = "Transcripción con Whisper (MLX)"
+        else:
+            command = [
+                sys.executable,
+                str(transcriber),
+                "--input",
+                str(audio_root),
+                "--file-list",
+                str(file_list),
+                "--output",
+                str(transcript_root),
+                "--model",
+                args.whisper_model,
+                "--model-dir",
+                str(models_dir / "whisper"),
+                "--device",
+                args.device,
+                "--compute-type",
+                compute_type,
+                "--language",
+                args.language,
+                "--beam-size",
+                str(args.beam_size),
+                "--batch-size",
+                str(batch_size),
+                "--word-timestamps",
+            ]
+            label = "Transcripción con Faster-Whisper"
         if args.force:
             command.append("--force")
-        run_stage(command, env, "Transcripción con Faster-Whisper")
+        run_stage(command, env, label)
 
     if not args.skip_diarization:
-        command = [
-            sys.executable,
-            str(diarizer),
-            "--audio-root",
-            str(audio_root),
-            "--transcript-root",
-            str(transcript_root),
-            "--output-root",
-            str(diarization_root),
-            "--cache-dir",
-            str(models_dir / "pyannote-cache"),
-            "--model",
-            args.pyannote_model,
-            "--file-list",
-            str(file_list),
-            "--device",
-            args.device,
-            "--segmentation-batch-size",
-            "6",
-            "--embedding-batch-size",
-            "16",
-        ]
-        if args.device == "cpu":
-            command.append("--allow-cpu")
+        if args.diarization_engine == "soniqo":
+            command = [
+                sys.executable,
+                str(diarizer),
+                "--audio-root",
+                str(audio_root),
+                "--transcript-root",
+                str(transcript_root),
+                "--output-root",
+                str(diarization_root),
+                "--file-list",
+                str(file_list),
+            ]
+            label = "Diarización con Soniqo (community1, CoreML)"
+        else:
+            command = [
+                sys.executable,
+                str(diarizer),
+                "--audio-root",
+                str(audio_root),
+                "--transcript-root",
+                str(transcript_root),
+                "--output-root",
+                str(diarization_root),
+                "--cache-dir",
+                str(models_dir / "pyannote-cache"),
+                "--model",
+                args.pyannote_model,
+                "--file-list",
+                str(file_list),
+                "--device",
+                args.device,
+                "--segmentation-batch-size",
+                "6",
+                "--embedding-batch-size",
+                "16",
+            ]
+            if args.device == "cpu":
+                command.append("--allow-cpu")
+            label = "Diarización y alineación con Pyannote"
         for option in ("num_speakers", "min_speakers", "max_speakers"):
             value = getattr(args, option)
             if value is not None:
                 command.extend((f"--{option.replace('_', '-')}", str(value)))
         if args.force:
             command.append("--force")
-        run_stage(command, env, "Diarización y alineación con Pyannote")
+        run_stage(command, env, label)
 
     index_path = write_result_index(
         output_root,

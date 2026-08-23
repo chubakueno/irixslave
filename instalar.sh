@@ -29,6 +29,12 @@ echo "Usando $("$PYTHON_BIN" --version) ($PYTHON_BIN)"
 ./.venv/bin/pip install --upgrade pip
 ./.venv/bin/pip install -r requirements.txt
 
+if ! command -v speech >/dev/null 2>&1; then
+  echo
+  echo "Instalando 'speech' (CLI de Soniqo, motor de diarización community1 en CoreML)..."
+  brew install speech
+fi
+
 echo
 echo "Listo. Entorno creado en .venv/"
 echo "Siguiente paso: ./configurar_huggingface.sh"

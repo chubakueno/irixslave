@@ -26,5 +26,8 @@ fi
   --input "$INPUT" \
   --output "$OUTPUT" \
   --device cpu \
+  --transcription-engine mlx \
+  --whisper-model "${WHISPER_MODEL:-mlx-community/whisper-large-v3-mlx}" \
+  --diarization-engine "${DIARIZATION_ENGINE:-soniqo}" \
   --language es \
   "$@"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -56,7 +57,9 @@ class Config:
     poll_interval: float
     heartbeat_interval: float
     whisper_model: str
+    transcription_engine: str
     pyannote_model: str
+    diarization_engine: str
     device: str
     language: str
     models_dir: Path
@@ -73,9 +76,11 @@ def load_config(poll_interval_override: float | None) -> Config:
         token=getenv(env_file, "RADIO_API_TOKEN", required=True),
         worker_id=getenv(env_file, "WORKER_ID", "mac-mini-luis-01"),
         poll_interval=poll_interval,
-        heartbeat_interval=float(getenv(env_file, "HEARTBEAT_INTERVAL_SECONDS", "60")),
-        whisper_model=getenv(env_file, "WHISPER_MODEL", "large-v3"),
+        heartbeat_interval=float(getenv(env_file, "HEARTBEAT_INTERVAL_SECONDS", "30")),
+        whisper_model=getenv(env_file, "WHISPER_MODEL", "mlx-community/whisper-large-v3-mlx"),
+        transcription_engine=getenv(env_file, "TRANSCRIPTION_ENGINE", "mlx"),
         pyannote_model=getenv(env_file, "PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1"),
+        diarization_engine=getenv(env_file, "DIARIZATION_ENGINE", "soniqo"),
         device=getenv(env_file, "DEVICE", "cpu"),
         language=getenv(env_file, "TRANSCRIPTION_LANGUAGE", "es"),
         models_dir=PACKAGE_ROOT / "modelos",
@@ -190,8 +195,10 @@ def run_local_pipeline(cfg: Config, audio_path: Path, out_dir: Path) -> None:
         "--output", str(out_dir),
         "--language", cfg.language,
         "--device", cfg.device,
+        "--transcription-engine", cfg.transcription_engine,
         "--whisper-model", cfg.whisper_model,
         "--pyannote-model", cfg.pyannote_model,
+        "--diarization-engine", cfg.diarization_engine,
         "--models-dir", str(cfg.models_dir),
     ]
     completed = subprocess.run(command, cwd=PACKAGE_ROOT)
@@ -216,21 +223,27 @@ def build_payload(speakers_data: dict[str, Any], transcript_data: dict[str, Any]
     units = speakers_data.get("units") or []
 
     text = "\n".join(f"[{turn['speaker']}] {turn['text']}" for turn in turns).strip()
-    words = [
-        {
-            "word": unit.get("text", ""),
+    words = []
+    for unit in units:
+        word: dict[str, Any] = {
+            "text": str(unit.get("text", "")).strip(),
             "start": unit.get("start"),
             "end": unit.get("end"),
-            "probability": unit.get("probability"),
-            "speaker": unit.get("speaker"),
+            "type": "word",
+            "speaker_id": unit.get("speaker"),
         }
-        for unit in units
-    ]
+        probability = unit.get("probability")
+        if probability is not None and probability > 0:
+            word["logprob"] = math.log(probability)
+        words.append(word)
 
     return {
         "text": text,
         "language": transcript_data.get("language") or cfg.language,
-        "model": f"faster-whisper-{cfg.whisper_model}+{cfg.pyannote_model.split('/')[-1]}",
+        "model": (
+            f"{cfg.transcription_engine}-{cfg.whisper_model.split('/')[-1]}"
+            f"+{cfg.diarization_engine}-{cfg.pyannote_model.split('/')[-1]}"
+        ),
         "words": words,
     }
 

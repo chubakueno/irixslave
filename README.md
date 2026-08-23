@@ -204,13 +204,17 @@ La carpeta `scripts_originales/` conserva los productores, monitores y auditores
 
 ## macOS (Apple Silicon)
 
-Este paquete también corre en Mac (M1/M2/M3/M4). `faster-whisper` y `pyannote-audio` no tienen backend Metal/MPS, así que en Mac todo corre en CPU (`--device cpu`, ya es el valor por defecto en los scripts de esta sección). En una M4 de 16 GB, `large-v3` + diarización caben en memoria pero son notablemente más lentos que en la GPU CUDA original: cuenta con varias veces la duración del audio en tiempo de proceso. Si necesitas iteración rápida, usa `--whisper-model medium` o `--whisper-model large-v3-turbo` con `ejecutar.sh -- --whisper-model medium`.
+Este paquete también corre en Mac (M1/M2/M3/M4). La transcripción usa `mlx-whisper` (motor `--transcription-engine mlx`, por defecto en `ejecutar.sh` y en el worker), que corre sobre Metal/GPU vía Apple MLX — mucho más rápido que CPU pura. El modelo por defecto es `mlx-community/whisper-large-v3-mlx` (mismos pesos que `large-v3`, sin cuantizar, sin la pérdida de calidad de una cuantización agresiva a 4/8 bit). Ojo: variantes como `-fp16` u `-8bit` de ese mismo repo empaquetan los pesos como `model.safetensors`, un nombre que el loader de `mlx_whisper==0.4.3` (la última versión publicada) no reconoce — solo busca `weights.npz` o `weights.safetensors`. Si cambias de modelo, verifica primero el nombre del archivo de pesos en la pestaña "Files" del repo en Hugging Face.
+
+La diarización usa el motor `soniqo` (`--diarization-engine soniqo`, por defecto en el worker): llama al CLI [`speech`](https://github.com/soniqo/speech-swift) (`brew install speech`) con `--engine community1`, que corre el mismo modelo `pyannote/speaker-diarization-community-1` pero sobre CoreML/Neural Engine en vez de PyTorch/CPU — en pruebas con audio real, ~17× tiempo real (vs. CPU) con conteo y proporción de hablantes casi idénticos a `pyannote-audio`. `scripts_originales/diarizar_soniqo.py` hace de wrapper: convierte el audio a WAV, llama al CLI, y reutiliza la misma lógica de alineación palabra↔hablante de `diarizar.py`.
+
+Para usar el pipeline 100% PyTorch original (útil para comparar, o si `speech` no está disponible) pasa `--diarization-engine pyannote` a `pipeline_transcripcion_diarizada.py`; esa ruta sigue corriendo en CPU (`--device cpu`), ya que pyannote-audio no tiene backend Metal/MPS maduro. Igual para transcripción: `--transcription-engine faster-whisper --whisper-model large-v3` vuelve al motor original CTranslate2/CPU.
 
 Instalación:
 
 ```bash
 brew install python@3.12
-./instalar.sh
+./instalar.sh   # también instala 'speech' (brew) si falta
 ./configurar_huggingface.sh   # acepta antes las condiciones en huggingface.co/pyannote/speaker-diarization-community-1
 ```
 
@@ -235,7 +239,7 @@ Uso directo:
    ./.venv/bin/python worker_transcripcion.py --live             # loop continuo
    ```
 
-Cada job renueva el lease con un heartbeat cada 60 s mientras se procesa. El campo `text` que se sube queda formateado como `[SPEAKER_00] texto...` por turno, y cada palabra en `words` incluye un campo adicional `speaker` (no forma parte del contrato documentado por la API, pero la mayoría de backends JSON ignoran campos extra; si el backend valida el esquema en modo estricto, avísame para quitarlo).
+Cada job renueva el lease con un heartbeat cada 30 s mientras se procesa (margen de seguridad frente al TTL del lease en el backend, para que no se rehabilite el job para otro worker). El campo `text` que se sube queda formateado como `[SPEAKER_00] texto...` por turno, y cada `word` incluye `text`, `start`, `end`, `type: "word"`, `speaker_id` y `logprob` (derivado de la probabilidad de Whisper).
 
 ## Verificación del paquete
 
