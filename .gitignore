@@ -1,0 +1,8 @@
+.venv/
+modelos/
+resultados/
+__pycache__/
+*.log
+*.pid
+HF_TOKEN
+.env
