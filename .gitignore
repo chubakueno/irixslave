@@ -1,6 +1,8 @@
 .venv/
 modelos/
+resultado/
 resultados/
+resultados_worker/
 __pycache__/
 *.log
 *.pid
