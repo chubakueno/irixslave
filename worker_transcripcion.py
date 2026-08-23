@@ -4,6 +4,8 @@ import argparse
 import json
 import math
 import os
+import platform
+import socket
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,7 @@ import requests
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 ENV_PATH = PACKAGE_ROOT / ".env"
+IS_MACOS = platform.system() == "Darwin"
 
 sys.path.insert(0, str(PACKAGE_ROOT))
 from pipeline_transcripcion_diarizada import AUDIO_EXTENSIONS  # noqa: E402
@@ -71,17 +74,34 @@ def load_config(poll_interval_override: float | None) -> Config:
     poll_interval = poll_interval_override
     if poll_interval is None:
         poll_interval = float(getenv(env_file, "POLL_INTERVAL_SECONDS", "15"))
+
+    # Defaults por plataforma: en Apple Silicon usa los motores acelerados
+    # (MLX/Soniqo); en Windows/Linux con NVIDIA cae al pipeline original
+    # (faster-whisper/pyannote sobre CUDA). Todo overridable vía .env.
+    if IS_MACOS:
+        default_worker_id = "mac-mini-luis-01"
+        default_transcription_engine = "mlx"
+        default_whisper_model = "mlx-community/whisper-large-v3-mlx"
+        default_diarization_engine = "soniqo"
+        default_device = "cpu"
+    else:
+        default_worker_id = f"worker-{socket.gethostname()}"
+        default_transcription_engine = "faster-whisper"
+        default_whisper_model = "large-v3"
+        default_diarization_engine = "pyannote"
+        default_device = "cuda"
+
     return Config(
         base_url=getenv(env_file, "RADIO_BASE_URL", "https://radio.datadaf.com").rstrip("/"),
         token=getenv(env_file, "RADIO_API_TOKEN", required=True),
-        worker_id=getenv(env_file, "WORKER_ID", "mac-mini-luis-01"),
+        worker_id=getenv(env_file, "WORKER_ID", default_worker_id),
         poll_interval=poll_interval,
         heartbeat_interval=float(getenv(env_file, "HEARTBEAT_INTERVAL_SECONDS", "30")),
-        whisper_model=getenv(env_file, "WHISPER_MODEL", "mlx-community/whisper-large-v3-mlx"),
-        transcription_engine=getenv(env_file, "TRANSCRIPTION_ENGINE", "mlx"),
+        whisper_model=getenv(env_file, "WHISPER_MODEL", default_whisper_model),
+        transcription_engine=getenv(env_file, "TRANSCRIPTION_ENGINE", default_transcription_engine),
         pyannote_model=getenv(env_file, "PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1"),
-        diarization_engine=getenv(env_file, "DIARIZATION_ENGINE", "soniqo"),
-        device=getenv(env_file, "DEVICE", "cpu"),
+        diarization_engine=getenv(env_file, "DIARIZATION_ENGINE", default_diarization_engine),
+        device=getenv(env_file, "DEVICE", default_device),
         language=getenv(env_file, "TRANSCRIPTION_LANGUAGE", "es"),
         models_dir=PACKAGE_ROOT / "modelos",
         results_dir=PACKAGE_ROOT / "resultados_worker",

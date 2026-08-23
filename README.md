@@ -241,6 +241,26 @@ Uso directo:
 
 Cada job renueva el lease con un heartbeat cada 30 s mientras se procesa (margen de seguridad frente al TTL del lease en el backend, para que no se rehabilite el job para otro worker). El campo `text` que se sube queda formateado como `[SPEAKER_00] texto...` por turno, y cada `word` incluye `text`, `start`, `end`, `type: "word"`, `speaker_id` y `logprob` (derivado de la probabilidad de Whisper).
 
+### El worker en Windows (RTX 4060 o similar)
+
+`worker_transcripcion.py` es Python puro — corre igual en Windows. Detecta el sistema operativo automáticamente y elige los motores correctos: en Windows/Linux usa `faster-whisper` + `pyannote` sobre CUDA (el pipeline original), no MLX/Soniqo (exclusivos de Apple Silicon). No hace falta tocar `.env` para eso.
+
+```powershell
+.\instalar.ps1
+.\configurar_huggingface.ps1
+copy .env.example .env   # completa RADIO_API_TOKEN
+.\.venv\Scripts\python.exe worker_transcripcion.py --once
+```
+
+Para correrlo en loop sin que Windows suspenda el equipo:
+```powershell
+.\correr_worker.ps1          # dry-run
+.\correr_worker.ps1 -Live    # sube resultados reales
+```
+(evita la suspensión solo mientras esa ventana está abierta, vía `SetThreadExecutionState`; no cambia la configuración de energía de forma permanente).
+
+Nota: esta parte no se probó en una máquina Windows real durante el desarrollo — la lógica multiplataforma se revisó por inspección de código, no con una corrida real en Windows/CUDA.
+
 ## Verificación del paquete
 
 Esta comprobación no descarga modelos ni procesa audio:
