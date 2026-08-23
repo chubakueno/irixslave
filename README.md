@@ -4,12 +4,24 @@ Este paquete reproduce el flujo utilizado para convertir audios en una transcrip
 
 **No contiene modelos, audios, transcripciones, cachés ni credenciales.** Los nombres de los modelos están configurados en los scripts y sus archivos se descargan únicamente cuando el usuario instala o ejecuta el pipeline.
 
+## Plataformas soportadas
+
+| | Windows + NVIDIA | macOS (Apple Silicon) |
+|---|---|---|
+| Transcripción | `faster-whisper` (CTranslate2) sobre CUDA | `mlx-whisper` sobre Metal/GPU |
+| Diarización | `pyannote-audio` (PyTorch) sobre CUDA/CPU | CLI `speech --engine community1` (Soniqo) sobre CoreML/Neural Engine |
+| Instalador | `instalar.ps1` | `instalar.sh` |
+| Lanzador simple | `ejecutar.ps1` | `ejecutar.sh` |
+| Worker de jobs | `worker_transcripcion.py` (mismo script, autodetecta el SO) | `worker_transcripcion.py` |
+
+El orquestador (`pipeline_transcripcion_diarizada.py`) es el mismo en ambas plataformas — solo cambia qué motor invoca por debajo, vía `--transcription-engine` y `--diarization-engine`. Detalles de los motores de Apple Silicon (Soniqo/MLX) más abajo, en [macOS: detalle de los motores MLX y Soniqo](#macos-detalle-de-los-motores-mlx-y-soniqo).
+
 ## Modelos utilizados
 
-- Transcripción: `large-v3`, mediante `faster-whisper`.
-- Diarización: `pyannote/speaker-diarization-community-1`.
+- Transcripción: `large-v3` (mismos pesos en ambos motores — `faster-whisper` en Windows/CUDA, `mlx-whisper` en macOS).
+- Diarización: `pyannote/speaker-diarization-community-1` (mismo modelo — vía `pyannote-audio`/PyTorch en Windows, o vía CoreML en macOS con Soniqo).
 
-El flujo probado en el proyecto se ejecutó con una NVIDIA GeForce RTX 5060 Laptop GPU, CUDA, `int8_float16`, `batch_size=12`, `beam_size=1` y tiempos por palabra activados.
+El flujo original del proyecto se ejecutó con una NVIDIA GeForce RTX 5060 Laptop GPU, CUDA, `int8_float16`, `batch_size=12`, `beam_size=1` y tiempos por palabra activados. La adaptación a macOS (Apple Silicon, M1-M4) usa los mismos parámetros donde aplica.
 
 ## Qué hace el programa
 
@@ -29,7 +41,7 @@ Audio
        JSON/TXT/SRT con hablante + texto + tiempos
 ```
 
-Whisper reconoce las palabras. Pyannote analiza las voces, detecta cambios de hablante y agrupa fragmentos acústicamente similares. Después, `diarizar.py` asigna cada palabra de Whisper al intervalo de voz con mayor solapamiento temporal. Las palabras consecutivas del mismo hablante, separadas por no más de 0.8 segundos, se convierten en un turno.
+Whisper reconoce las palabras. Pyannote analiza las voces, detecta cambios de hablante y agrupa fragmentos acústicamente similares. Después, `diarizar.py` (o `diarizar_soniqo.py` en macOS) asigna cada palabra de Whisper al intervalo de voz con mayor solapamiento temporal. Las palabras consecutivas del mismo hablante, separadas por no más de 0.8 segundos, se convierten en un turno. El diagrama muestra los motores de Windows/CUDA; en macOS son `mlx-whisper` y Soniqo `community1` (mismos modelos, otro runtime — ver [detalle de los motores MLX y Soniqo](#macos-detalle-de-los-motores-mlx-y-soniqo)).
 
 ## Advertencia sobre la identidad
 
@@ -39,15 +51,21 @@ Para colocar nombres reales se necesita una etapa posterior de identificación d
 
 ## Requisitos
 
-- Windows 10 u 11.
-- Python 3.12 de 64 bits.
+**Windows + NVIDIA:**
+- Windows 10 u 11, Python 3.12 de 64 bits.
 - GPU NVIDIA y controlador compatible para la configuración CUDA recomendada.
-- Espacio libre para descargar los modelos al ejecutar.
 - Cuenta de Hugging Face para aceptar las condiciones de Pyannote Community-1.
 
-El pipeline también admite CPU con parámetros manuales, pero la diarización y el modelo `large-v3` serán considerablemente más lentos.
+**macOS (Apple Silicon):**
+- macOS con chip M1-M4, Python 3.12.
+- [Homebrew](https://brew.sh) (para `speech`, el CLI de diarización).
+- Cuenta de Hugging Face para aceptar las condiciones de Pyannote Community-1.
+
+En ambos casos: espacio libre para descargar los modelos al ejecutar (varios GB). El pipeline también admite CPU pura con parámetros manuales (`--transcription-engine faster-whisper --device cpu` en Windows), pero será considerablemente más lento.
 
 ## Instalación
+
+### Windows + NVIDIA
 
 Abra PowerShell dentro de esta carpeta:
 
@@ -56,9 +74,16 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\instalar.ps1
 ```
 
-El instalador crea `.venv` y descarga las dependencias. No descarga todavía los pesos de Whisper ni Pyannote.
+### macOS (Apple Silicon)
 
-Después, acepte las condiciones del modelo en:
+```bash
+brew install python@3.12
+./instalar.sh   # también instala 'speech' (Homebrew) si falta
+```
+
+### Ambas plataformas
+
+El instalador crea `.venv` y descarga las dependencias. No descarga todavía los pesos de Whisper ni Pyannote. Después, acepte las condiciones del modelo en:
 
 `https://huggingface.co/pyannote/speaker-diarization-community-1`
 
@@ -67,12 +92,15 @@ Configure la autorización:
 ```powershell
 .\configurar_huggingface.ps1
 ```
+```bash
+./configurar_huggingface.sh
+```
 
 El token se introduce en el prompt seguro de Hugging Face. No debe escribirse dentro de un script, Markdown, archivo `.env`, comando compartido o chat.
 
 ## Uso sencillo
 
-Para un audio:
+**Windows**, para un audio:
 
 ```powershell
 .\ejecutar.ps1 -InputPath "C:\ruta\entrevista.mp3" -OutputPath "C:\ruta\resultado"
@@ -84,9 +112,18 @@ Para una carpeta completa y sus subcarpetas:
 .\ejecutar.ps1 -InputPath "C:\ruta\audios" -OutputPath "C:\ruta\resultado"
 ```
 
+**macOS**, mismo idea:
+
+```bash
+./ejecutar.sh "/ruta/entrevista.mp3" resultado
+./ejecutar.sh "/ruta/audios" resultado
+```
+
 El primer uso descargará los archivos de los modelos. Esas descargas se almacenarán en `modelos/`, una carpeta excluida de este paquete.
 
 ## Uso directo de Python
+
+**Windows (CUDA):**
 
 ```powershell
 .\.venv\Scripts\python.exe .\pipeline_transcripcion_diarizada.py `
@@ -99,13 +136,23 @@ El primer uso descargará los archivos de los modelos. Esas descargas se almacen
   --batch-size 12
 ```
 
-Si se conoce el número exacto de hablantes de un audio, se puede indicar:
+**macOS (MLX + Soniqo):**
 
-```powershell
-.\.venv\Scripts\python.exe .\pipeline_transcripcion_diarizada.py `
-  --input "C:\ruta\entrevista.mp3" `
-  --output "C:\ruta\resultado" `
-  --num-speakers 2
+```bash
+./.venv/bin/python pipeline_transcripcion_diarizada.py \
+  --input "/ruta/audios" \
+  --output "resultado" \
+  --device cpu \
+  --transcription-engine mlx \
+  --whisper-model "mlx-community/whisper-large-v3-mlx" \
+  --diarization-engine soniqo \
+  --beam-size 1
+```
+
+Si se conoce el número exacto de hablantes de un audio, se puede indicar con `--num-speakers` (funciona igual en ambas plataformas, ambos motores de diarización lo respetan):
+
+```bash
+./.venv/bin/python pipeline_transcripcion_diarizada.py --input "/ruta/entrevista.mp3" --output "resultado" --num-speakers 2
 ```
 
 No conviene fijar `--num-speakers` si el dato no es seguro. También existen `--min-speakers` y `--max-speakers`.
@@ -172,16 +219,18 @@ La diarización exclusiva facilita asignar una sola etiqueta a cada palabra. Los
 
 ## Reanudación
 
-Los scripts registran progreso y omiten resultados completos. Si el proceso se interrumpe, ejecute el mismo comando para continuar. Use `-Force` únicamente si desea recalcular resultados existentes.
+Los scripts registran progreso y omiten resultados completos. Si el proceso se interrumpe, ejecute el mismo comando para continuar. Use `-Force` (Windows, `ejecutar.ps1`) o `--force` (macOS/Python directo) únicamente si desea recalcular resultados existentes.
 
 ## Scripts incluidos
 
 ### Entrada recomendada
 
-- `pipeline_transcripcion_diarizada.py`: coordina las dos etapas y genera el índice final.
-- `ejecutar.ps1`: acceso sencillo para Windows.
-- `instalar.ps1`: crea el entorno e instala dependencias.
-- `configurar_huggingface.ps1`: configura el acceso al modelo gated sin guardar el token en el proyecto.
+- `pipeline_transcripcion_diarizada.py`: coordina las dos etapas y genera el índice final. Multiplataforma (`--transcription-engine`, `--diarization-engine`).
+- `ejecutar.ps1` / `ejecutar.sh`: acceso sencillo, Windows y macOS respectivamente.
+- `instalar.ps1` / `instalar.sh`: crean el entorno e instalan dependencias.
+- `configurar_huggingface.ps1` / `configurar_huggingface.sh`: configuran el acceso al modelo gated sin guardar el token en el proyecto.
+- `worker_transcripcion.py`: hace polling de trabajos en `radio.datadaf.com`, procesa localmente y sube el resultado. Multiplataforma, autodetecta el SO (ver [Worker de polling](#worker-de-polling-radiodatadafcom)).
+- `correr_worker.sh` / `correr_worker.ps1`: corren el worker evitando que el equipo se suspenda.
 - `verificar_paquete.py`: comprueba sintaxis, archivos obligatorios y ausencia de modelos, audios y tokens.
 
 ### Copias exactas del pipeline usado
@@ -202,36 +251,27 @@ La carpeta `scripts_originales/` conserva los productores, monitores y auditores
 
 `configurar_huggingface.ps1` también es copia del script usado. Se coloca en la raíz porque sigue siendo el método recomendado para autenticar la instalación nueva.
 
-## macOS (Apple Silicon)
+Además, `scripts_originales/transcribir_mlx.py` y `scripts_originales/diarizar_soniqo.py` son implementaciones nuevas (no copias del proyecto original) que dan el mismo resultado que `transcribir.py`/`diarizar.py` pero usando los motores acelerados de Apple Silicon — ver [detalle de los motores MLX y Soniqo](#macos-detalle-de-los-motores-mlx-y-soniqo).
 
-Este paquete también corre en Mac (M1/M2/M3/M4). La transcripción usa `mlx-whisper` (motor `--transcription-engine mlx`, por defecto en `ejecutar.sh` y en el worker), que corre sobre Metal/GPU vía Apple MLX — mucho más rápido que CPU pura. El modelo por defecto es `mlx-community/whisper-large-v3-mlx` (mismos pesos que `large-v3`, sin cuantizar, sin la pérdida de calidad de una cuantización agresiva a 4/8 bit). Ojo: variantes como `-fp16` u `-8bit` de ese mismo repo empaquetan los pesos como `model.safetensors`, un nombre que el loader de `mlx_whisper==0.4.3` (la última versión publicada) no reconoce — solo busca `weights.npz` o `weights.safetensors`. Si cambias de modelo, verifica primero el nombre del archivo de pesos en la pestaña "Files" del repo en Hugging Face.
+## macOS: detalle de los motores MLX y Soniqo
+
+La transcripción usa `mlx-whisper` (motor `--transcription-engine mlx`, por defecto en `ejecutar.sh` y en el worker), que corre sobre Metal/GPU vía Apple MLX — mucho más rápido que CPU pura. El modelo por defecto es `mlx-community/whisper-large-v3-mlx` (mismos pesos que `large-v3`, sin cuantizar, sin la pérdida de calidad de una cuantización agresiva a 4/8 bit). Ojo: variantes como `-fp16` u `-8bit` de ese mismo repo empaquetan los pesos como `model.safetensors`, un nombre que el loader de `mlx_whisper==0.4.3` (la última versión publicada) no reconoce — solo busca `weights.npz` o `weights.safetensors`. Si cambias de modelo, verifica primero el nombre del archivo de pesos en la pestaña "Files" del repo en Hugging Face.
 
 La diarización usa el motor `soniqo` (`--diarization-engine soniqo`, por defecto en el worker): llama al CLI [`speech`](https://github.com/soniqo/speech-swift) (`brew install speech`) con `--engine community1`, que corre el mismo modelo `pyannote/speaker-diarization-community-1` pero sobre CoreML/Neural Engine en vez de PyTorch/CPU — en pruebas con audio real, ~17× tiempo real (vs. CPU) con conteo y proporción de hablantes casi idénticos a `pyannote-audio`. `scripts_originales/diarizar_soniqo.py` hace de wrapper: convierte el audio a WAV, llama al CLI, y reutiliza la misma lógica de alineación palabra↔hablante de `diarizar.py`.
 
-Para usar el pipeline 100% PyTorch original (útil para comparar, o si `speech` no está disponible) pasa `--diarization-engine pyannote` a `pipeline_transcripcion_diarizada.py`; esa ruta sigue corriendo en CPU (`--device cpu`), ya que pyannote-audio no tiene backend Metal/MPS maduro. Igual para transcripción: `--transcription-engine faster-whisper --whisper-model large-v3` vuelve al motor original CTranslate2/CPU.
-
-Instalación:
-
-```bash
-brew install python@3.12
-./instalar.sh   # también instala 'speech' (brew) si falta
-./configurar_huggingface.sh   # acepta antes las condiciones en huggingface.co/pyannote/speaker-diarization-community-1
-```
-
-Uso directo:
-
-```bash
-./ejecutar.sh "/ruta/audio.mp3" resultado
-```
+Para usar el pipeline 100% PyTorch original (útil para comparar, o si `speech` no está disponible) pasa `--diarization-engine pyannote` a `pipeline_transcripcion_diarizada.py`; esa ruta sigue corriendo en CPU (`--device cpu`), ya que pyannote-audio no tiene backend Metal/MPS maduro. Igual para transcripción: `--transcription-engine faster-whisper --whisper-model large-v3` vuelve al motor original CTranslate2/CPU. Instalación y uso básico: ver [Instalación](#instalación) y [Uso sencillo](#uso-sencillo) arriba.
 
 ## Worker de polling (radio.datadaf.com)
 
-`worker_transcripcion.py` hace polling de trabajos en la API interna, descarga el audio, corre este mismo pipeline localmente y sube el resultado.
+`worker_transcripcion.py` hace polling de trabajos en la API interna, descarga el audio, corre este mismo pipeline localmente y sube el resultado. Es Python puro y corre igual en Windows y macOS: detecta el sistema operativo automáticamente y elige los motores correctos (macOS → `mlx`/`soniqo`; Windows/Linux → `faster-whisper`/`pyannote` sobre CUDA), sin necesidad de tocar `.env` para eso.
 
 1. Copia `.env.example` a `.env` y completa `RADIO_API_TOKEN` (nunca lo pegues en el chat ni lo commitees; `.env` ya está en `.gitignore`).
 2. Corre un solo job en modo de prueba (no sube nada, solo guarda el resultado en `resultados_worker/<job_id>.json` y lo imprime):
    ```bash
-   ./.venv/bin/python worker_transcripcion.py --once
+   ./.venv/bin/python worker_transcripcion.py --once          # macOS
+   ```
+   ```powershell
+   .\.venv\Scripts\python.exe worker_transcripcion.py --once   # Windows
    ```
 3. Revisa el JSON generado. Cuando estés conforme, sube resultados reales:
    ```bash
@@ -241,32 +281,28 @@ Uso directo:
 
 Cada job renueva el lease con un heartbeat cada 30 s mientras se procesa (margen de seguridad frente al TTL del lease en el backend, para que no se rehabilite el job para otro worker). El campo `text` que se sube queda formateado como `[SPEAKER_00] texto...` por turno, y cada `word` incluye `text`, `start`, `end`, `type: "word"`, `speaker_id` y `logprob` (derivado de la probabilidad de Whisper).
 
-### El worker en Windows (RTX 4060 o similar)
-
-`worker_transcripcion.py` es Python puro — corre igual en Windows. Detecta el sistema operativo automáticamente y elige los motores correctos: en Windows/Linux usa `faster-whisper` + `pyannote` sobre CUDA (el pipeline original), no MLX/Soniqo (exclusivos de Apple Silicon). No hace falta tocar `.env` para eso.
-
-```powershell
-.\instalar.ps1
-.\configurar_huggingface.ps1
-copy .env.example .env   # completa RADIO_API_TOKEN
-.\.venv\Scripts\python.exe worker_transcripcion.py --once
+Para correr el worker en loop continuo sin que el equipo se suspenda:
+```bash
+./correr_worker.sh           # macOS, dry-run
+./correr_worker.sh --live    # macOS, sube resultados reales
 ```
-
-Para correrlo en loop sin que Windows suspenda el equipo:
 ```powershell
-.\correr_worker.ps1          # dry-run
-.\correr_worker.ps1 -Live    # sube resultados reales
+.\correr_worker.ps1          # Windows, dry-run
+.\correr_worker.ps1 -Live    # Windows, sube resultados reales
 ```
-(evita la suspensión solo mientras esa ventana está abierta, vía `SetThreadExecutionState`; no cambia la configuración de energía de forma permanente).
+Ninguno cambia la configuración de energía del sistema de forma permanente — solo evitan la suspensión mientras ese proceso/ventana sigue abierto (`caffeinate -s` en macOS, `SetThreadExecutionState` en Windows).
 
-Nota: esta parte no se probó en una máquina Windows real durante el desarrollo — la lógica multiplataforma se revisó por inspección de código, no con una corrida real en Windows/CUDA.
+Nota: la ruta Windows (RTX 4060 o similar) no se probó en una máquina real durante el desarrollo — la lógica multiplataforma se revisó por inspección de código, no con una corrida real en Windows/CUDA.
 
 ## Verificación del paquete
 
 Esta comprobación no descarga modelos ni procesa audio:
 
 ```powershell
-python .\verificar_paquete.py
+.\.venv\Scripts\python.exe .\verificar_paquete.py
+```
+```bash
+./.venv/bin/python verificar_paquete.py
 ```
 
 El resultado esperado es `PAQUETE_APROBADO`.
