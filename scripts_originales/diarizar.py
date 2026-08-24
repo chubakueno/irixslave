@@ -75,7 +75,7 @@ def load_audio(path: Path, max_seconds: float | None = None) -> torch.Tensor:
         format="s16", layout="mono", rate=SAMPLE_RATE
     )
 
-    with av.open(str(path)) as container:
+    with av.open(str(path), metadata_errors="replace") as container:
         if not container.streams.audio:
             raise RuntimeError("El archivo no contiene una pista de audio.")
         stream = container.streams.audio[0]
@@ -345,25 +345,28 @@ def append_progress(path: Path, row: dict[str, Any]) -> None:
         writer.writerow(row)
 
 
-def main() -> int:
-    args = parse_args()
-    audio_root = args.audio_root.resolve()
-    transcript_root = args.transcript_root.resolve()
-    output_root = args.output_root.resolve()
-    cache_dir = args.cache_dir.resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
+def load_pipeline(
+    model: str,
+    cache_dir: Path,
+    device_arg: str,
+    segmentation_batch_size: int,
+    embedding_batch_size: int,
+    *,
+    allow_cpu: bool = False,
+) -> tuple[torch.device, Any]:
+    cache_dir = cache_dir.resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.device == "cpu":
+    if device_arg == "cpu":
         device = torch.device("cpu")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cpu" and not args.allow_cpu:
+    if device.type == "cpu" and not allow_cpu:
         raise RuntimeError(
             "CUDA no está disponible. Se detiene para evitar una ejecución accidental de varios días."
         )
 
-    model_path = Path(args.model)
+    model_path = Path(model)
     is_local_model = model_path.exists()
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or get_token()
     if not is_local_model and not token:
@@ -378,7 +381,7 @@ def main() -> int:
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
 
-    source = str(model_path.resolve()) if is_local_model else args.model
+    source = str(model_path.resolve()) if is_local_model else model
     print(f"MODEL={source}")
     pipeline = Pipeline.from_pretrained(
         source,
@@ -387,9 +390,105 @@ def main() -> int:
     )
     pipeline.to(device)
     if hasattr(pipeline, "segmentation_batch_size"):
-        pipeline.segmentation_batch_size = args.segmentation_batch_size
+        pipeline.segmentation_batch_size = segmentation_batch_size
     if hasattr(pipeline, "embedding_batch_size"):
-        pipeline.embedding_batch_size = args.embedding_batch_size
+        pipeline.embedding_batch_size = embedding_batch_size
+    return device, pipeline
+
+
+def diarize_one(
+    pipeline: Any,
+    device: torch.device,
+    audio_path: Path,
+    audio_root: Path,
+    transcript_root: Path,
+    output_root: Path,
+    model_name: str,
+    *,
+    num_speakers: int | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+    test_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Diariza un solo audio con un pipeline ya cargado y escribe sus salidas.
+    No atrapa excepciones: el llamador decide si continúa con el resto del lote."""
+    relative_audio = audio_path.resolve().relative_to(audio_root)
+    output_base = output_root / relative_audio.with_suffix("")
+    started = time.perf_counter()
+
+    waveform = load_audio(audio_path, test_seconds)
+    duration = waveform.shape[1] / SAMPLE_RATE
+    uri = safe_uri(relative_audio)
+    pipeline_input = {"waveform": waveform, "sample_rate": SAMPLE_RATE, "uri": uri}
+    call_kwargs = {}
+    for name, value in (
+        ("num_speakers", num_speakers),
+        ("min_speakers", min_speakers),
+        ("max_speakers", max_speakers),
+    ):
+        if value is not None:
+            call_kwargs[name] = value
+
+    while True:
+        try:
+            result = pipeline(pipeline_input, **call_kwargs)
+            break
+        except torch.OutOfMemoryError:
+            old_seg = int(getattr(pipeline, "segmentation_batch_size", 1))
+            old_emb = int(getattr(pipeline, "embedding_batch_size", 1))
+            if old_seg <= 1 and old_emb <= 1:
+                raise
+            pipeline.segmentation_batch_size = max(1, old_seg // 2)
+            pipeline.embedding_batch_size = max(1, old_emb // 2)
+            torch.cuda.empty_cache()
+            print(
+                "  OOM: reintento con lotes "
+                f"{pipeline.segmentation_batch_size}/{pipeline.embedding_batch_size}",
+                flush=True,
+            )
+
+    transcript_path = transcript_root / relative_audio.with_suffix(".json")
+    transcript = None
+    if transcript_path.exists() and test_seconds is None:
+        transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+    elapsed = time.perf_counter() - started
+    stats = write_outputs(
+        output_base,
+        relative_audio,
+        model_name,
+        elapsed,
+        duration,
+        result.speaker_diarization,
+        result.exclusive_speaker_diarization,
+        result.speaker_embeddings,
+        transcript,
+    )
+    del waveform, result
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "audio_seconds": round(duration, 3),
+        "processing_seconds": round(elapsed, 3),
+        **stats,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    audio_root = args.audio_root.resolve()
+    transcript_root = args.transcript_root.resolve()
+    output_root = args.output_root.resolve()
+    cache_dir = args.cache_dir.resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    device, pipeline = load_pipeline(
+        args.model,
+        cache_dir,
+        args.device,
+        args.segmentation_batch_size,
+        args.embedding_batch_size,
+        allow_cpu=args.allow_cpu,
+    )
 
     files = (
         read_file_list(args.file_list.resolve(), audio_root)
@@ -413,53 +512,18 @@ def main() -> int:
         print(f"[{index}/{len(files)}] START {relative_audio}", flush=True)
         started = time.perf_counter()
         try:
-            waveform = load_audio(audio_path, args.test_seconds)
-            duration = waveform.shape[1] / SAMPLE_RATE
-            uri = safe_uri(relative_audio)
-            pipeline_input = {
-                "waveform": waveform,
-                "sample_rate": SAMPLE_RATE,
-                "uri": uri,
-            }
-            call_kwargs = {}
-            for name in ("num_speakers", "min_speakers", "max_speakers"):
-                value = getattr(args, name)
-                if value is not None:
-                    call_kwargs[name] = value
-
-            while True:
-                try:
-                    result = pipeline(pipeline_input, **call_kwargs)
-                    break
-                except torch.OutOfMemoryError:
-                    old_seg = int(getattr(pipeline, "segmentation_batch_size", 1))
-                    old_emb = int(getattr(pipeline, "embedding_batch_size", 1))
-                    if old_seg <= 1 and old_emb <= 1:
-                        raise
-                    pipeline.segmentation_batch_size = max(1, old_seg // 2)
-                    pipeline.embedding_batch_size = max(1, old_emb // 2)
-                    torch.cuda.empty_cache()
-                    print(
-                        "  OOM: reintento con lotes "
-                        f"{pipeline.segmentation_batch_size}/{pipeline.embedding_batch_size}",
-                        flush=True,
-                    )
-
-            transcript_path = transcript_root / relative_audio.with_suffix(".json")
-            transcript = None
-            if transcript_path.exists() and args.test_seconds is None:
-                transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
-            elapsed = time.perf_counter() - started
-            stats = write_outputs(
-                output_base,
-                relative_audio,
+            stats = diarize_one(
+                pipeline,
+                device,
+                audio_path,
+                audio_root,
+                transcript_root,
+                output_root,
                 args.model,
-                elapsed,
-                duration,
-                result.speaker_diarization,
-                result.exclusive_speaker_diarization,
-                result.speaker_embeddings,
-                transcript,
+                num_speakers=args.num_speakers,
+                min_speakers=args.min_speakers,
+                max_speakers=args.max_speakers,
+                test_seconds=args.test_seconds,
             )
             successes += 1
             append_progress(
@@ -468,20 +532,15 @@ def main() -> int:
                     "timestamp_utc": utc_now(),
                     "audio": str(relative_audio),
                     "status": "ok",
-                    "audio_seconds": round(duration, 3),
-                    "processing_seconds": round(elapsed, 3),
                     **stats,
                     "error": "",
                 },
             )
             print(
                 f"[{index}/{len(files)}] OK speakers={stats['speakers']} "
-                f"time={elapsed:.1f}s",
+                f"time={stats['processing_seconds']:.1f}s",
                 flush=True,
             )
-            del waveform, result
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
         except Exception as exc:
             errors += 1
             elapsed = time.perf_counter() - started

@@ -24,7 +24,7 @@ def safe_text(value: str) -> str:
 
 
 def audio_duration_seconds(path: Path) -> float:
-    with av.open(str(path)) as container:
+    with av.open(str(path), metadata_errors="replace") as container:
         stream = container.streams.audio[0]
         if stream.duration is not None:
             return float(stream.duration * stream.time_base)

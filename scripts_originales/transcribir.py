@@ -25,7 +25,7 @@ def safe_text(value: str) -> str:
 
 
 def audio_duration_seconds(path: Path) -> float:
-    with av.open(str(path)) as container:
+    with av.open(str(path), metadata_errors="replace") as container:
         stream = container.streams.audio[0]
         if stream.duration is not None:
             return float(stream.duration * stream.time_base)
@@ -92,6 +92,71 @@ def write_outputs(audio: Path, root: Path, out_root: Path, info, segments) -> No
         ),
         encoding="utf-8",
     )
+
+
+def load_model(model: str, device: str, compute_type: str, model_dir: Path, batch_size: int):
+    model_obj = WhisperModel(
+        model,
+        device=device,
+        compute_type=compute_type,
+        download_root=str(model_dir),
+    )
+    return BatchedInferencePipeline(model=model_obj) if batch_size > 0 else model_obj
+
+
+def transcribe_one(
+    transcriber,
+    audio: Path,
+    root: Path,
+    out_root: Path,
+    *,
+    language: str,
+    beam_size: int,
+    batch_size: int,
+    disable_vad: bool = False,
+    word_timestamps: bool = True,
+) -> dict[str, str]:
+    """Transcribe un solo audio con un modelo ya cargado y escribe sus salidas.
+    No atrapa excepciones: el llamador decide si continúa con el resto del lote."""
+    relative = str(audio.relative_to(root))
+    started = time.perf_counter()
+    transcribe_options = {
+        "language": language,
+        "task": "transcribe",
+        "beam_size": beam_size,
+        "temperature": 0,
+        "vad_filter": not disable_vad,
+        "condition_on_previous_text": False,
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.0,
+        "no_speech_threshold": 0.6,
+        "word_timestamps": word_timestamps,
+    }
+    if not disable_vad:
+        transcribe_options["vad_parameters"] = {"min_silence_duration_ms": 700}
+    elif batch_size > 0:
+        duration = audio_duration_seconds(audio)
+        transcribe_options["clip_timestamps"] = [
+            {"start": start, "end": min(start + 30.0, duration)}
+            for start in range(0, int(duration + 29.999), 30)
+            if start < duration
+        ]
+    if batch_size > 0:
+        transcribe_options["batch_size"] = batch_size
+        if word_timestamps:
+            transcribe_options["without_timestamps"] = False
+    segments_iter, info = transcriber.transcribe(str(audio), **transcribe_options)
+    segments = list(segments_iter)
+    write_outputs(audio, root, out_root, info, segments)
+    elapsed = time.perf_counter() - started
+    return {
+        "audio": relative,
+        "status": "ok",
+        "seconds": f"{elapsed:.1f}",
+        "duration": f"{info.duration:.1f}",
+        "language": info.language,
+        "message": "",
+    }
 
 
 def main() -> int:
@@ -165,13 +230,7 @@ def main() -> int:
         print("No hay audios pendientes.")
         return 0
 
-    model = WhisperModel(
-        args.model,
-        device=args.device,
-        compute_type=args.compute_type,
-        download_root=str(model_dir),
-    )
-    transcriber = BatchedInferencePipeline(model=model) if args.batch_size > 0 else model
+    transcriber = load_model(args.model, args.device, args.compute_type, model_dir, args.batch_size)
 
     fields = ["audio", "status", "seconds", "duration", "language", "message"]
     with log_path.open("a", encoding="utf-8", newline="") as log_fh:
@@ -182,44 +241,20 @@ def main() -> int:
             started = time.perf_counter()
             print(f"[{number}/{len(pending)}] {relative}", flush=True)
             try:
-                transcribe_options = {
-                    "language": args.language,
-                    "task": "transcribe",
-                    "beam_size": args.beam_size,
-                    "temperature": 0,
-                    "vad_filter": not args.disable_vad,
-                    "condition_on_previous_text": False,
-                    "compression_ratio_threshold": 2.4,
-                    "log_prob_threshold": -1.0,
-                    "no_speech_threshold": 0.6,
-                    "word_timestamps": args.word_timestamps,
-                }
-                if not args.disable_vad:
-                    transcribe_options["vad_parameters"] = {"min_silence_duration_ms": 700}
-                elif args.batch_size > 0:
-                    duration = audio_duration_seconds(audio)
-                    transcribe_options["clip_timestamps"] = [
-                        {"start": start, "end": min(start + 30.0, duration)}
-                        for start in range(0, int(duration + 29.999), 30)
-                        if start < duration
-                    ]
-                if args.batch_size > 0:
-                    transcribe_options["batch_size"] = args.batch_size
-                    if args.word_timestamps:
-                        transcribe_options["without_timestamps"] = False
-                segments_iter, info = transcriber.transcribe(str(audio), **transcribe_options)
-                segments = list(segments_iter)
-                write_outputs(audio, root, out_root, info, segments)
-                elapsed = time.perf_counter() - started
-                row = {
-                    "audio": relative,
-                    "status": "ok",
-                    "seconds": f"{elapsed:.1f}",
-                    "duration": f"{info.duration:.1f}",
-                    "language": info.language,
-                    "message": "",
-                }
-                print(f"  OK | {info.duration / 60:.1f} min de audio | {elapsed / 60:.1f} min de proceso", flush=True)
+                row = transcribe_one(
+                    transcriber,
+                    audio,
+                    root,
+                    out_root,
+                    language=args.language,
+                    beam_size=args.beam_size,
+                    batch_size=args.batch_size,
+                    disable_vad=args.disable_vad,
+                    word_timestamps=args.word_timestamps,
+                )
+                info_duration = float(row["duration"])
+                elapsed = float(row["seconds"])
+                print(f"  OK | {info_duration / 60:.1f} min de audio | {elapsed / 60:.1f} min de proceso", flush=True)
             except Exception as exc:  # keep the batch running if one file is damaged
                 elapsed = time.perf_counter() - started
                 row = {

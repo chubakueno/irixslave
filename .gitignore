@@ -3,6 +3,7 @@ modelos/
 resultado/
 resultados/
 resultados_worker/
+.worker_tmp/
 __pycache__/
 *.log
 *.pid

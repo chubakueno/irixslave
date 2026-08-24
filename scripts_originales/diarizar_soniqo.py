@@ -40,7 +40,7 @@ def audio_to_wav(path: Path, dest: Path) -> float:
         wav_out.setnchannels(1)
         wav_out.setsampwidth(2)
         wav_out.setframerate(SAMPLE_RATE)
-        with av.open(str(path)) as container:
+        with av.open(str(path), metadata_errors="replace") as container:
             if not container.streams.audio:
                 raise RuntimeError("El archivo no contiene una pista de audio.")
             stream = container.streams.audio[0]

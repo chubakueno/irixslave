@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,13 @@ import requests
 PACKAGE_ROOT = Path(__file__).resolve().parent
 ENV_PATH = PACKAGE_ROOT / ".env"
 IS_MACOS = platform.system() == "Darwin"
+IS_WINDOWS = platform.system() == "Windows"
+STOP_KEY = b"q"
+
+# Carpeta propia (en vez de %TEMP%) para los audios descargados por job. Así la
+# exclusión de Windows Defender puede apuntar a esta única carpeta en vez de a
+# todo %TEMP%, que comparten otros programas.
+WORKER_TMP_DIR = PACKAGE_ROOT / ".worker_tmp"
 
 sys.path.insert(0, str(PACKAGE_ROOT))
 from pipeline_transcripcion_diarizada import AUDIO_EXTENSIONS  # noqa: E402
@@ -181,6 +189,68 @@ class HeartbeatThread(threading.Thread):
         self._stop.set()
 
 
+class StopKeyWatcher(threading.Thread):
+    """Escucha la tecla STOP_KEY sin bloquear stdin, para pedir una detención
+    ordenada (termina el job en curso, no toma uno nuevo) sin usar Ctrl+C,
+    que sigue matando el proceso de inmediato."""
+
+    def __init__(self, stop_event: threading.Event) -> None:
+        super().__init__(daemon=True)
+        self._stop_requested = stop_event
+        self._stop_watching = threading.Event()
+
+    def run(self) -> None:
+        try:
+            if IS_WINDOWS:
+                self._watch_windows()
+            else:
+                self._watch_posix()
+        except Exception:
+            pass  # entorno sin consola interactiva (servicio, nohup, etc.): sin tecla, solo Ctrl+C
+
+    def _trigger(self) -> None:
+        if not self._stop_requested.is_set():
+            print(
+                f"\n  [tecla '{STOP_KEY.decode()}' detectada: se terminará el job actual "
+                "y no se tomarán más. Ctrl+C sigue cortando de inmediato.]"
+            )
+        self._stop_requested.set()
+
+    def _watch_windows(self) -> None:
+        import msvcrt
+
+        while not self._stop_watching.is_set():
+            if msvcrt.kbhit():
+                key = msvcrt.getch().lower()
+                if key == STOP_KEY:
+                    self._trigger()
+            else:
+                time.sleep(0.2)
+
+    def _watch_posix(self) -> None:
+        import select
+        import termios
+        import tty
+
+        if not sys.stdin.isatty():
+            return
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self._stop_watching.is_set():
+                ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                if ready:
+                    key = sys.stdin.read(1).lower().encode()
+                    if key == STOP_KEY:
+                        self._trigger()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def stop(self) -> None:
+        self._stop_watching.set()
+
+
 def guess_suffix(url: str, content_type: str | None) -> str:
     path_suffix = Path(url.split("?")[0]).suffix.lower()
     if path_suffix in AUDIO_EXTENSIONS:
@@ -194,6 +264,41 @@ def guess_suffix(url: str, content_type: str | None) -> str:
     return ".mp3"
 
 
+LOCAL_LOCK_MAX_ATTEMPTS = 4
+LOCAL_LOCK_RETRY_DELAY = 5.0
+LOCAL_LOCK_MAX_DELAY = 20.0
+
+
+def is_local_file_lock_error(exc: BaseException) -> bool:
+    """WinError 32: archivo bloqueado por otro proceso (típicamente el antivirus
+    escaneando el mp3 recién descargado). Es transitorio y local a esta máquina,
+    no un fallo real del job — no debería consumir un intento en el servidor.
+
+    Se detecta por el texto porque algunas capas internas (p.ej. ctranslate2/av)
+    re-lanzan el error de I/O como una excepción propia sin preservar el
+    atributo `winerror`, aunque el mensaje original se conserve."""
+    if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 32:
+        return True
+    text = str(exc)
+    return "WinError 32" in text or "being used by another process" in text
+
+
+def wait_until_readable(path: Path, attempts: int = 6, initial_delay: float = 0.3) -> None:
+    """En Windows, un antivirus (p.ej. Defender) puede tener el archivo recién
+    descargado bajo lock mientras lo escanea. Reintenta abrirlo antes de
+    devolver el control, en vez de que el motor falle el job de inmediato."""
+    delay = initial_delay
+    for attempt in range(1, attempts + 1):
+        try:
+            with path.open("rb"):
+                return
+        except OSError:
+            if attempt == attempts:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
 def download_audio(session: requests.Session, url: str, headers: dict[str, str], dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     with session.get(url, headers=headers or {}, stream=True, timeout=120) as resp:
@@ -204,6 +309,7 @@ def download_audio(session: requests.Session, url: str, headers: dict[str, str],
             for chunk in resp.iter_content(chunk_size=1 << 20):
                 if chunk:
                     fh.write(chunk)
+    wait_until_readable(dest)
     return dest
 
 
@@ -268,7 +374,13 @@ def build_payload(speakers_data: dict[str, Any], transcript_data: dict[str, Any]
     }
 
 
-def handle_job(session: requests.Session, cfg: Config, job: dict[str, Any], live: bool) -> None:
+def handle_job(
+    session: requests.Session,
+    cfg: Config,
+    job: dict[str, Any],
+    live: bool,
+    engine: Any | None = None,
+) -> None:
     job_id = job.get("job_id") or job.get("id")
     lease_id = job.get("lease_id") or job.get("leaseId")
     audio = job.get("audio") or {}
@@ -285,7 +397,10 @@ def handle_job(session: requests.Session, cfg: Config, job: dict[str, Any], live
     heartbeat = HeartbeatThread(session, cfg, job_id, lease_id, cfg.heartbeat_interval)
     heartbeat.start()
     try:
-        with tempfile.TemporaryDirectory(prefix=f"job_{job_id}_") as tmp:
+        WORKER_TMP_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=f"job_{job_id}_", dir=str(WORKER_TMP_DIR), ignore_cleanup_errors=True
+        ) as tmp:
             tmp_path = Path(tmp)
             print("  descargando audio...")
             audio_path = download_audio(session, audio_url, audio_headers, tmp_path / "in")
@@ -294,9 +409,36 @@ def handle_job(session: requests.Session, cfg: Config, job: dict[str, Any], live
 
             print("  transcribiendo + diarizando localmente (puede tardar varios minutos en CPU)...")
             out_dir = tmp_path / "out"
-            run_local_pipeline(cfg, audio_path, out_dir)
-
-            speakers_data, transcript_data = load_results(out_dir)
+            attempt = 1
+            while True:
+                try:
+                    if engine is not None:
+                        speakers_data, transcript_data = engine.process(
+                            audio_path, out_dir, language=cfg.language
+                        )
+                    else:
+                        run_local_pipeline(cfg, audio_path, out_dir)
+                        speakers_data, transcript_data = load_results(out_dir)
+                    break
+                except Exception as exc:
+                    if is_local_file_lock_error(exc):
+                        print(
+                            f"  archivo bloqueado localmente (WinError 32) en el intento {attempt}. "
+                            "Traceback completo para diagnóstico:",
+                            file=sys.stderr,
+                        )
+                        traceback.print_exc()
+                        if attempt < LOCAL_LOCK_MAX_ATTEMPTS:
+                            delay = min(LOCAL_LOCK_RETRY_DELAY * attempt, LOCAL_LOCK_MAX_DELAY)
+                            print(
+                                f"  reintento local {attempt}/{LOCAL_LOCK_MAX_ATTEMPTS - 1} "
+                                f"en {delay:.0f}s...",
+                                file=sys.stderr,
+                            )
+                            time.sleep(delay)
+                            attempt += 1
+                            continue
+                    raise
             payload = build_payload(speakers_data, transcript_data, cfg)
 
         cfg.results_dir.mkdir(parents=True, exist_ok=True)
@@ -313,6 +455,7 @@ def handle_job(session: requests.Session, cfg: Config, job: dict[str, Any], live
         print("  subido correctamente (complete).")
     except Exception as exc:
         print(f"  ERROR: {exc}", file=sys.stderr)
+        traceback.print_exc()
         if live:
             try:
                 fail_job(session, cfg, job_id, lease_id, str(exc), retryable=True)
@@ -339,33 +482,79 @@ def main() -> int:
         help="Procesa un solo job (o detecta que no hay ninguno pendiente) y termina.",
     )
     parser.add_argument("--poll-interval", type=float, help="Segundos entre intentos de lease cuando no hay trabajo.")
+    parser.add_argument(
+        "--persistent-models",
+        action="store_true",
+        help=(
+            "Carga Whisper y Pyannote una sola vez al arrancar y los mantiene en memoria entre "
+            "jobs (evita recargar el modelo en cada transcripción). Solo soporta "
+            "transcription-engine=faster-whisper y diarization-engine=pyannote."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.poll_interval)
     session = requests.Session()
 
-    print(f"Worker '{cfg.worker_id}' -> {cfg.base_url}  (modo: {'LIVE' if args.live else 'DRY-RUN'})")
-    while True:
-        try:
-            job = lease_job(session, cfg)
-        except requests.RequestException as exc:
-            print(f"Error al pedir trabajo: {exc}", file=sys.stderr)
-            job = None
+    engine = None
+    if args.persistent_models:
+        if cfg.transcription_engine != "faster-whisper" or cfg.diarization_engine != "pyannote":
+            raise SystemExit(
+                "--persistent-models solo soporta transcription-engine=faster-whisper y "
+                f"diarization-engine=pyannote (actual: {cfg.transcription_engine}/{cfg.diarization_engine})."
+            )
+        from motor_persistente import PersistentEngine
 
-        if job is None:
-            print("Sin trabajos pendientes.")
+        compute_type = "int8_float16" if cfg.device == "cuda" else "int8"
+        batch_size = 12 if cfg.device == "cuda" else 0
+        print("Cargando modelos en memoria (whisper + pyannote)...")
+        engine = PersistentEngine(
+            whisper_model=cfg.whisper_model,
+            device=cfg.device,
+            compute_type=compute_type,
+            models_dir=cfg.models_dir,
+            batch_size=batch_size,
+            beam_size=1,
+            pyannote_model=cfg.pyannote_model,
+        )
+
+    stop_requested = threading.Event()
+    key_watcher: StopKeyWatcher | None = None
+    if not args.once:
+        key_watcher = StopKeyWatcher(stop_requested)
+        key_watcher.start()
+        print(f"(Presiona '{STOP_KEY.decode()}' para detener el worker tras el job actual.)")
+
+    print(f"Worker '{cfg.worker_id}' -> {cfg.base_url}  (modo: {'LIVE' if args.live else 'DRY-RUN'})")
+    try:
+        while True:
+            if stop_requested.is_set():
+                print("Detención solicitada: no se tomarán más trabajos. Saliendo.")
+                return 0
+
+            try:
+                job = lease_job(session, cfg)
+            except requests.RequestException as exc:
+                print(f"Error al pedir trabajo: {exc}", file=sys.stderr)
+                job = None
+
+            if job is None:
+                print("Sin trabajos pendientes.")
+                if args.once:
+                    return 0
+                time.sleep(cfg.poll_interval)
+                continue
+
+            try:
+                handle_job(session, cfg, job, live=args.live, engine=engine)
+            except Exception:
+                pass  # ya fue reportado/loggeado dentro de handle_job
+
             if args.once:
                 return 0
-            time.sleep(cfg.poll_interval)
-            continue
-
-        try:
-            handle_job(session, cfg, job, live=args.live)
-        except Exception:
-            pass  # ya fue reportado/loggeado dentro de handle_job
-
-        if args.once:
-            return 0
+    finally:
+        if key_watcher:
+            key_watcher.stop()
 
 
 if __name__ == "__main__":
