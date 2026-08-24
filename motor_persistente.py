@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,7 @@ class PersistentEngine:
         transcript_root = out_dir / "transcripciones"
         diarization_root = out_dir / "diarizaciones"
 
+        print(f"  [motor persistente] transcribiendo... ({datetime.now().strftime('%H:%M:%S')})", flush=True)
         transcribir.transcribe_one(
             self.transcriber,
             audio_path,
@@ -82,6 +84,7 @@ class PersistentEngine:
             word_timestamps=True,
         )
 
+        print(f"  [motor persistente] diarizando... ({datetime.now().strftime('%H:%M:%S')})", flush=True)
         diarizar.diarize_one(
             self.pipeline,
             self.diarization_device,
