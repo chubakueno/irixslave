@@ -31,7 +31,7 @@ STOP_KEY = b"q"
 WORKER_TMP_DIR = PACKAGE_ROOT / ".worker_tmp"
 
 sys.path.insert(0, str(PACKAGE_ROOT))
-from pipeline_transcripcion_diarizada import AUDIO_EXTENSIONS  # noqa: E402
+from pipeline_transcripcion_diarizada import AUDIO_EXTENSIONS, nvidia_library_dirs  # noqa: E402
 
 
 def load_dotenv(path: Path) -> dict[str, str]:
@@ -79,6 +79,26 @@ class Config:
 
 def load_config(poll_interval_override: float | None) -> Config:
     env_file = load_dotenv(ENV_PATH)
+    # diarizar.py busca el token de Hugging Face en el entorno real (HF_TOKEN /
+    # HUGGING_FACE_HUB_TOKEN) antes de caer al caché de "hf auth login". Si vino
+    # por .env en vez de por una variable ya exportada, lo exportamos aquí para
+    # que tanto el subproceso de pipeline_transcripcion_diarizada.py como el
+    # motor persistente (que importa diarizar.py en el mismo proceso) lo vean.
+    for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        value = env_file.get(key)
+        if value and not os.environ.get(key):
+            os.environ[key] = value
+
+    # --persistent-models importa diarizar.py/transcribir.py en este mismo
+    # proceso (motor_persistente.py), no por subproceso, así que no pasa por
+    # runtime_environment(). ctranslate2 necesita estas libs de cualquier
+    # forma; hay que exportarlas ANTES de que main() importe motor_persistente
+    # (que es cuando ctranslate2 las carga), por eso va aquí y no más abajo.
+    lib_dirs = [str(path) for path in nvidia_library_dirs()]
+    if lib_dirs:
+        path_var = "PATH" if IS_WINDOWS else "LD_LIBRARY_PATH"
+        os.environ[path_var] = os.pathsep.join(lib_dirs + [os.environ.get(path_var, "")])
+
     poll_interval = poll_interval_override
     if poll_interval is None:
         poll_interval = float(getenv(env_file, "POLL_INTERVAL_SECONDS", "15"))
@@ -181,9 +201,9 @@ class HeartbeatThread(threading.Thread):
         while not self._stop.wait(self._interval):
             try:
                 send_heartbeat(self._session, self._cfg, self._job_id, self._lease_id)
-                print(f"  [heartbeat OK {datetime.now().strftime('%H:%M:%S')}]")
+                print(f"  [{self._job_id}] [heartbeat OK {datetime.now().strftime('%H:%M:%S')}]")
             except Exception as exc:
-                print(f"  [heartbeat ERROR: {exc}]", file=sys.stderr)
+                print(f"  [{self._job_id}] [heartbeat ERROR: {exc}]", file=sys.stderr)
 
     def stop(self) -> None:
         self._stop.set()
@@ -374,13 +394,37 @@ def build_payload(speakers_data: dict[str, Any], transcript_data: dict[str, Any]
     }
 
 
-def handle_job(
-    session: requests.Session,
-    cfg: Config,
-    job: dict[str, Any],
-    live: bool,
-    engine: Any | None = None,
-) -> None:
+@dataclass
+class PreparedJob:
+    """Un job ya leaseado y con el audio descargado, listo para procesar.
+    Cada PreparedJob tiene su propia Session porque se lease/descarga en un
+    hilo de pre-descarga mientras el job anterior aún se está procesando (y
+    reportando su heartbeat) en el hilo principal; usar una única Session
+    compartida entre esos dos hilos concurrentes no es seguro."""
+
+    job: dict[str, Any]
+    job_id: str
+    lease_id: str
+    session: requests.Session
+    tmp_dir: tempfile.TemporaryDirectory
+    audio_path: Path
+    heartbeat: HeartbeatThread
+
+
+def prepare_job(cfg: Config, live: bool) -> PreparedJob | None:
+    """Lease + descarga de audio, sin transcribir/diarizar todavía. Se llama
+    tanto para el job actual como, en un hilo aparte, para pre-descargar el
+    siguiente mientras el actual se procesa (así se evitan los segundos
+    muertos de descarga en los que no se usa ni CPU ni GPU)."""
+    session = requests.Session()
+    try:
+        job = lease_job(session, cfg)
+    except requests.RequestException as exc:
+        print(f"Error al pedir trabajo: {exc}", file=sys.stderr)
+        return None
+    if job is None:
+        return None
+
     job_id = job.get("job_id") or job.get("id")
     lease_id = job.get("lease_id") or job.get("leaseId")
     audio = job.get("audio") or {}
@@ -388,58 +432,92 @@ def handle_job(
     audio_headers = audio.get("headers") or {}
 
     if not job_id or not lease_id or not audio_url:
-        raise RuntimeError(
+        print(
             "Respuesta de lease incompleta o con un esquema inesperado:\n"
-            + json.dumps(job, ensure_ascii=False, indent=2)[:2000]
+            + json.dumps(job, ensure_ascii=False, indent=2)[:2000],
+            file=sys.stderr,
         )
+        return None
 
-    print(f"\n=== Job {job_id} (lease {lease_id}) ===")
     heartbeat = HeartbeatThread(session, cfg, job_id, lease_id, cfg.heartbeat_interval)
     heartbeat.start()
-    try:
-        WORKER_TMP_DIR.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=f"job_{job_id}_", dir=str(WORKER_TMP_DIR), ignore_cleanup_errors=True
-        ) as tmp:
-            tmp_path = Path(tmp)
-            print("  descargando audio...")
-            audio_path = download_audio(session, audio_url, audio_headers, tmp_path / "in")
-            size_mb = audio_path.stat().st_size / 1e6
-            print(f"  audio: {audio_path.name} ({size_mb:.1f} MB)")
 
-            print("  transcribiendo + diarizando localmente (puede tardar varios minutos en CPU)...")
-            out_dir = tmp_path / "out"
-            attempt = 1
-            while True:
-                try:
-                    if engine is not None:
-                        speakers_data, transcript_data = engine.process(
-                            audio_path, out_dir, language=cfg.language
-                        )
-                    else:
-                        run_local_pipeline(cfg, audio_path, out_dir)
-                        speakers_data, transcript_data = load_results(out_dir)
-                    break
-                except Exception as exc:
-                    if is_local_file_lock_error(exc):
+    WORKER_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_dir = tempfile.TemporaryDirectory(
+        prefix=f"job_{job_id}_", dir=str(WORKER_TMP_DIR), ignore_cleanup_errors=True
+    )
+    try:
+        print(f"  [{job_id}] descargando audio por adelantado...")
+        audio_path = download_audio(session, audio_url, audio_headers, Path(tmp_dir.name) / "in")
+        size_mb = audio_path.stat().st_size / 1e6
+        print(f"  [{job_id}] audio listo: {audio_path.name} ({size_mb:.1f} MB)")
+    except Exception as exc:
+        heartbeat.stop()
+        print(f"  [{job_id}] ERROR al descargar: {exc}", file=sys.stderr)
+        traceback.print_exc()
+        if live:
+            try:
+                fail_job(session, cfg, job_id, lease_id, str(exc), retryable=True)
+                print(f"  [{job_id}] reportado como fallido (fail, retryable=true).")
+            except Exception as fail_exc:
+                print(f"  [{job_id}] no se pudo reportar el fallo a la API: {fail_exc}", file=sys.stderr)
+        tmp_dir.cleanup()
+        return None
+
+    return PreparedJob(
+        job=job,
+        job_id=job_id,
+        lease_id=lease_id,
+        session=session,
+        tmp_dir=tmp_dir,
+        audio_path=audio_path,
+        heartbeat=heartbeat,
+    )
+
+
+def process_prepared_job(cfg: Config, prepared: PreparedJob, live: bool, engine: Any | None = None) -> None:
+    job_id = prepared.job_id
+    lease_id = prepared.lease_id
+    session = prepared.session
+
+    print(f"\n=== Job {job_id} (lease {lease_id}) ===")
+    try:
+        tmp_path = Path(prepared.tmp_dir.name)
+        print(f"  audio ya descargado: {prepared.audio_path.name}")
+
+        print("  transcribiendo + diarizando localmente (puede tardar varios minutos en CPU)...")
+        out_dir = tmp_path / "out"
+        attempt = 1
+        while True:
+            try:
+                if engine is not None:
+                    speakers_data, transcript_data = engine.process(
+                        prepared.audio_path, out_dir, language=cfg.language
+                    )
+                else:
+                    run_local_pipeline(cfg, prepared.audio_path, out_dir)
+                    speakers_data, transcript_data = load_results(out_dir)
+                break
+            except Exception as exc:
+                if is_local_file_lock_error(exc):
+                    print(
+                        f"  archivo bloqueado localmente (WinError 32) en el intento {attempt}. "
+                        "Traceback completo para diagnóstico:",
+                        file=sys.stderr,
+                    )
+                    traceback.print_exc()
+                    if attempt < LOCAL_LOCK_MAX_ATTEMPTS:
+                        delay = min(LOCAL_LOCK_RETRY_DELAY * attempt, LOCAL_LOCK_MAX_DELAY)
                         print(
-                            f"  archivo bloqueado localmente (WinError 32) en el intento {attempt}. "
-                            "Traceback completo para diagnóstico:",
+                            f"  reintento local {attempt}/{LOCAL_LOCK_MAX_ATTEMPTS - 1} "
+                            f"en {delay:.0f}s...",
                             file=sys.stderr,
                         )
-                        traceback.print_exc()
-                        if attempt < LOCAL_LOCK_MAX_ATTEMPTS:
-                            delay = min(LOCAL_LOCK_RETRY_DELAY * attempt, LOCAL_LOCK_MAX_DELAY)
-                            print(
-                                f"  reintento local {attempt}/{LOCAL_LOCK_MAX_ATTEMPTS - 1} "
-                                f"en {delay:.0f}s...",
-                                file=sys.stderr,
-                            )
-                            time.sleep(delay)
-                            attempt += 1
-                            continue
-                    raise
-            payload = build_payload(speakers_data, transcript_data, cfg)
+                        time.sleep(delay)
+                        attempt += 1
+                        continue
+                raise
+        payload = build_payload(speakers_data, transcript_data, cfg)
 
         cfg.results_dir.mkdir(parents=True, exist_ok=True)
         result_path = cfg.results_dir / f"{job_id}.json"
@@ -464,7 +542,9 @@ def handle_job(
                 print(f"  no se pudo reportar el fallo a la API: {fail_exc}", file=sys.stderr)
         raise
     finally:
-        heartbeat.stop()
+        prepared.heartbeat.stop()
+        prepared.tmp_dir.cleanup()
+        prepared.session.close()
 
 
 def main() -> int:
@@ -494,7 +574,6 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = load_config(args.poll_interval)
-    session = requests.Session()
 
     engine = None
     if args.persistent_models:
@@ -527,31 +606,45 @@ def main() -> int:
 
     print(f"Worker '{cfg.worker_id}' -> {cfg.base_url}  (modo: {'LIVE' if args.live else 'DRY-RUN'})")
     try:
+        current: PreparedJob | None = None
         while True:
-            if stop_requested.is_set():
-                print("Detención solicitada: no se tomarán más trabajos. Saliendo.")
-                return 0
-
-            try:
-                job = lease_job(session, cfg)
-            except requests.RequestException as exc:
-                print(f"Error al pedir trabajo: {exc}", file=sys.stderr)
-                job = None
-
-            if job is None:
-                print("Sin trabajos pendientes.")
-                if args.once:
+            if current is None:
+                if stop_requested.is_set():
+                    print("Detención solicitada: no se tomarán más trabajos. Saliendo.")
                     return 0
-                time.sleep(cfg.poll_interval)
-                continue
+                current = prepare_job(cfg, args.live)
+                if current is None:
+                    print("Sin trabajos pendientes.")
+                    if args.once:
+                        return 0
+                    time.sleep(cfg.poll_interval)
+                    continue
+
+            # Mientras se procesa `current` (CPU/GPU), pre-descargamos el
+            # siguiente job en un hilo aparte para que ya esté listo al
+            # terminar (evita el hueco muerto de descarga entre jobs).
+            prefetch_thread: threading.Thread | None = None
+            prefetch_box: list[PreparedJob | None] = [None]
+            if not args.once and not stop_requested.is_set():
+                def _prefetch() -> None:
+                    prefetch_box[0] = prepare_job(cfg, args.live)
+
+                prefetch_thread = threading.Thread(target=_prefetch, daemon=True)
+                prefetch_thread.start()
 
             try:
-                handle_job(session, cfg, job, live=args.live, engine=engine)
+                process_prepared_job(cfg, current, live=args.live, engine=engine)
             except Exception:
-                pass  # ya fue reportado/loggeado dentro de handle_job
+                pass  # ya fue reportado/loggeado dentro de process_prepared_job
 
             if args.once:
                 return 0
+
+            if prefetch_thread is not None:
+                prefetch_thread.join()
+                current = prefetch_box[0]
+            else:
+                current = None
     finally:
         if key_watcher:
             key_watcher.stop()

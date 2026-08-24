@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import sysconfig
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -106,23 +107,56 @@ def reject_output_collisions(audio_root: Path, files: list[Path]) -> None:
         seen[output_key] = audio
 
 
+def load_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            values[key] = value
+    return values
+
+
+def nvidia_library_dirs() -> list[Path]:
+    """Carpetas de las libs nativas de los paquetes pip nvidia-cublas-cu12,
+    nvidia-cudnn-cu12 y nvidia-cuda-nvrtc-cu12 (mismo venv que este proceso).
+    ctranslate2 (motor de Faster-Whisper) las necesita para correr en CUDA y
+    no las trae empaquetadas en su wheel, ni en Windows ni en Linux; solo
+    cambia dónde busca el sistema operativo: PATH (DLLs) en Windows,
+    LD_LIBRARY_PATH (.so) en Linux."""
+    site_packages = Path(sysconfig.get_paths()["purelib"])
+    nvidia_root = site_packages / "nvidia"
+    subdir = "bin" if sys.platform == "win32" else "lib"
+    candidates = (nvidia_root / pkg / subdir for pkg in ("cublas", "cudnn", "cuda_nvrtc"))
+    return [path for path in candidates if path.is_dir()]
+
+
 def runtime_environment(output_root: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["PYANNOTE_METRICS_ENABLED"] = "false"
+
+    # Igual que worker_transcripcion.py: si el token de Hugging Face vino por
+    # .env en vez de por "hf auth login", lo pasamos al subproceso de
+    # diarizar.py (que lo busca en HF_TOKEN / HUGGING_FACE_HUB_TOKEN).
+    dotenv_values = load_dotenv(Path(__file__).resolve().parent / ".env")
+    for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        if dotenv_values.get(key) and not env.get(key):
+            env[key] = dotenv_values[key]
     matplotlib_cache = output_root / ".cache" / "matplotlib"
     matplotlib_cache.mkdir(parents=True, exist_ok=True)
     env["MPLCONFIGDIR"] = str(matplotlib_cache)
 
-    site_packages = Path(sys.prefix) / "Lib" / "site-packages"
-    cuda_bins = [
-        site_packages / "nvidia" / "cublas" / "bin",
-        site_packages / "nvidia" / "cudnn" / "bin",
-        site_packages / "nvidia" / "cuda_nvrtc" / "bin",
-    ]
-    existing_bins = [str(path) for path in cuda_bins if path.is_dir()]
-    if existing_bins:
-        env["PATH"] = os.pathsep.join(existing_bins + [env.get("PATH", "")])
+    lib_dirs = [str(path) for path in nvidia_library_dirs()]
+    if lib_dirs:
+        path_var = "PATH" if sys.platform == "win32" else "LD_LIBRARY_PATH"
+        env[path_var] = os.pathsep.join(lib_dirs + [env.get(path_var, "")])
     return env
 
 
