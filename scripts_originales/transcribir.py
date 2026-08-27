@@ -143,8 +143,6 @@ def transcribe_one(
         ]
     if batch_size > 0:
         transcribe_options["batch_size"] = batch_size
-        if word_timestamps:
-            transcribe_options["without_timestamps"] = False
     segments_iter, info = transcriber.transcribe(str(audio), **transcribe_options)
     segments = list(segments_iter)
     write_outputs(audio, root, out_root, info, segments)
