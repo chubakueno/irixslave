@@ -7,5 +7,13 @@ resultados_worker/
 __pycache__/
 *.log
 *.pid
+*.zip
 HF_TOKEN
 .env
+02_analysis/tools/ffmpeg/
+
+# Evidencia local TECO: puede contener audios, transcripciones, IDs y métricas.
+# La rama de revisión publica solo código y pruebas genéricas.
+00_project/
+01_data/
+03_work/

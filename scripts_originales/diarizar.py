@@ -16,11 +16,12 @@ from typing import Any
 # No enviar telemetría de duración/origen del audio salvo que el usuario la active.
 os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "false")
 
-import av
 import numpy as np
 import torch
 from huggingface_hub import get_token
 from pyannote.audio import Pipeline
+
+from audio_compat import decode_audio
 
 
 MODEL_ID = "pyannote/speaker-diarization-community-1"
@@ -69,36 +70,12 @@ def safe_uri(relative_path: Path) -> str:
 
 def load_audio(path: Path, max_seconds: float | None = None) -> torch.Tensor:
     max_samples = round(max_seconds * SAMPLE_RATE) if max_seconds else None
-    chunks: list[np.ndarray] = []
-    samples = 0
-    resampler = av.audio.resampler.AudioResampler(
-        format="s16", layout="mono", rate=SAMPLE_RATE
-    )
-
-    with av.open(str(path), metadata_errors="replace") as container:
-        if not container.streams.audio:
-            raise RuntimeError("El archivo no contiene una pista de audio.")
-        stream = container.streams.audio[0]
-        for frame in container.decode(stream):
-            converted = resampler.resample(frame)
-            for output_frame in converted if isinstance(converted, list) else [converted]:
-                if output_frame is None:
-                    continue
-                values = output_frame.to_ndarray().reshape(-1)
-                if max_samples is not None:
-                    values = values[: max_samples - samples]
-                if values.size:
-                    chunks.append(values.copy())
-                    samples += values.size
-                if max_samples is not None and samples >= max_samples:
-                    break
-            if max_samples is not None and samples >= max_samples:
-                break
-
-    if not chunks:
+    audio = decode_audio(path, sampling_rate=SAMPLE_RATE)
+    if max_samples is not None:
+        audio = audio[:max_samples]
+    if not audio.size:
         raise RuntimeError("No se pudieron decodificar muestras de audio.")
-    audio = np.concatenate(chunks).astype(np.float32) / 32768.0
-    return torch.from_numpy(audio).unsqueeze(0)
+    return torch.from_numpy(np.asarray(audio, dtype=np.float32)).unsqueeze(0)
 
 
 def annotation_intervals(annotation: Any) -> list[Interval]:

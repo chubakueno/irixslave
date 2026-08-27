@@ -21,7 +21,7 @@ El orquestador (`pipeline_transcripcion_diarizada.py`) es el mismo en ambas plat
 - Transcripción: `large-v3` (mismos pesos en ambos motores — `faster-whisper` en Windows/CUDA, `mlx-whisper` en macOS).
 - Diarización: `pyannote/speaker-diarization-community-1` (mismo modelo — vía `pyannote-audio`/PyTorch en Windows, o vía CoreML en macOS con Soniqo).
 
-El flujo original del proyecto se ejecutó con una NVIDIA GeForce RTX 5060 Laptop GPU, CUDA, `int8_float16`, `batch_size=12`, `beam_size=1` y tiempos por palabra activados. La adaptación a macOS (Apple Silicon, M1-M4) usa los mismos parámetros donde aplica.
+El flujo original del proyecto se ejecutó con una NVIDIA GeForce RTX 5060 Laptop GPU, CUDA, `int8_float16`, `batch_size=12`, `beam_size=1` y tiempos por palabra activados. El worker Windows/Linux usa ahora `batch_size=0` por defecto: conserva la continuidad secuencial dentro de cada audio para evitar omisiones observadas en límites internos. La cola continúa distribuyendo jobs concurrentemente entre varios workers/equipos. La adaptación a macOS (Apple Silicon, M1-M4) usa los mismos parámetros donde aplica.
 
 ## Qué hace el programa
 
@@ -133,7 +133,7 @@ El primer uso descargará los archivos de los modelos. Esas descargas se almacen
   --pyannote-model "pyannote/speaker-diarization-community-1" `
   --device cuda `
   --beam-size 1 `
-  --batch-size 12
+  --batch-size 0
 ```
 
 **macOS (MLX + Soniqo):**
@@ -266,6 +266,9 @@ Para usar el pipeline 100% PyTorch original (útil para comparar, o si `speech` 
 `worker_transcripcion.py` hace polling de trabajos en la API interna, descarga el audio, corre este mismo pipeline localmente y sube el resultado. Es Python puro y corre igual en Windows y macOS: detecta el sistema operativo automáticamente y elige los motores correctos (macOS → `mlx`/`soniqo`; Windows/Linux → `faster-whisper`/`pyannote` sobre CUDA), sin necesidad de tocar `.env` para eso.
 
 1. Copia `.env.example` a `.env` y completa `RADIO_API_TOKEN` (nunca lo pegues en el chat ni lo commitees; `.env` ya está en `.gitignore`).
+   El perfil de integridad por defecto es `WHISPER_BATCH_SIZE=0`. Para una
+   comparación o reversión controlada se puede indicar un valor mayor, por
+   ejemplo `12`, que reactiva el pase por lotes y su reparación de límites.
 2. Corre un solo job en modo de prueba (no sube nada, solo guarda el resultado en `resultados_worker/<job_id>.json` y lo imprime):
    ```bash
    ./.venv/bin/python worker_transcripcion.py --once          # macOS
@@ -281,6 +284,15 @@ Para usar el pipeline 100% PyTorch original (útil para comparar, o si `speech` 
 
 Cada job renueva el lease con un heartbeat cada 30 s mientras se procesa (margen de seguridad frente al TTL del lease en el backend, para que no se rehabilite el job para otro worker). El campo `text` que se sube queda formateado como `[SPEAKER_00] texto...` por turno, y cada `word` incluye `text`, `start`, `end`, `type: "word"`, `speaker_id` y `logprob` (derivado de la probabilidad de Whisper).
 
+`WHISPER_BATCH_SIZE=0` hace secuencial solo la decodificación Whisper de cada
+job; no serializa la cola global. Varios ordenadores siguen tomando jobs en
+paralelo mediante leases independientes. En la muestra dirigida M20, este
+perfil recuperó 289/289 palabras de control y conservó 47.199/47.199 palabras
+al pasar por Pyannote. Es una regresión del mismo modelo, no una garantía de
+transcripción perfecta para cualquier audio; ruido, música, solapamiento y
+nombres nuevos todavía requieren controles y, para verdad externa, escucha
+humana.
+
 Para correr el worker en loop continuo sin que el equipo se suspenda:
 ```bash
 ./correr_worker.sh           # macOS, dry-run
@@ -292,7 +304,10 @@ Para correr el worker en loop continuo sin que el equipo se suspenda:
 ```
 Ninguno cambia la configuración de energía del sistema de forma permanente — solo evitan la suspensión mientras ese proceso/ventana sigue abierto (`caffeinate -s` en macOS, `SetThreadExecutionState` en Windows).
 
-Nota: la ruta Windows (RTX 4060 o similar) no se probó en una máquina real durante el desarrollo — la lógica multiplataforma se revisó por inspección de código, no con una corrida real en Windows/CUDA.
+La ruta Windows/CUDA fue validada en una RTX 5060 Laptop de 8 GB. En otros
+modelos de GPU —incluidos hosts alquilados— se debe ejecutar primero la matriz
+offline y conservar un job activo por proceso hasta validar VRAM, throughput y
+Pyannote en ese equipo.
 
 ## Verificación del paquete
 

@@ -3,13 +3,37 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import time
 from datetime import timedelta
 from pathlib import Path
 
-import av
+from audio_compat import audio_duration_seconds, install_faster_whisper_audio_compat
+
+install_faster_whisper_audio_compat()
 from faster_whisper import BatchedInferencePipeline, WhisperModel
+
+from boundary_repair import repair_batched_boundaries
+
+
+def positive_env_integer(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} debe ser un entero positivo; recibido: {raw!r}") from error
+    if value < 1:
+        raise ValueError(f"{name} debe ser positivo; recibido: {value}")
+    return value
+
+
+def whisper_device_index() -> int | list[int]:
+    raw = os.environ.get("WHISPER_DEVICE_INDEX", "0")
+    values = [int(item.strip()) for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("WHISPER_DEVICE_INDEX requiere al menos un índice")
+    return values[0] if len(values) == 1 else values
 
 
 def timestamp(seconds: float) -> str:
@@ -22,16 +46,6 @@ def timestamp(seconds: float) -> str:
 
 def safe_text(value: str) -> str:
     return " ".join(value.strip().split())
-
-
-def audio_duration_seconds(path: Path) -> float:
-    with av.open(str(path), metadata_errors="replace") as container:
-        stream = container.streams.audio[0]
-        if stream.duration is not None:
-            return float(stream.duration * stream.time_base)
-        if container.duration is not None:
-            return float(container.duration / av.time_base)
-    raise RuntimeError(f"No se pudo determinar la duración de {path}")
 
 
 def write_outputs(audio: Path, root: Path, out_root: Path, info, segments) -> None:
@@ -95,10 +109,15 @@ def write_outputs(audio: Path, root: Path, out_root: Path, info, segments) -> No
 
 
 def load_model(model: str, device: str, compute_type: str, model_dir: Path, batch_size: int):
+    num_workers = positive_env_integer(
+        "WHISPER_NUM_WORKERS", 2 if device == "cuda" and batch_size > 0 else 1
+    )
     model_obj = WhisperModel(
         model,
         device=device,
+        device_index=whisper_device_index(),
         compute_type=compute_type,
+        num_workers=num_workers,
         download_root=str(model_dir),
     )
     return BatchedInferencePipeline(model=model_obj) if batch_size > 0 else model_obj
@@ -115,6 +134,7 @@ def transcribe_one(
     batch_size: int,
     disable_vad: bool = False,
     word_timestamps: bool = True,
+    repair_boundaries: bool | None = None,
 ) -> dict[str, str]:
     """Transcribe un solo audio con un modelo ya cargado y escribe sus salidas.
     No atrapa excepciones: el llamador decide si continúa con el resto del lote."""
@@ -147,6 +167,45 @@ def transcribe_one(
             transcribe_options["without_timestamps"] = False
     segments_iter, info = transcriber.transcribe(str(audio), **transcribe_options)
     segments = list(segments_iter)
+    if repair_boundaries is None:
+        repair_boundaries = os.environ.get("BOUNDARY_REPAIR_ENABLED", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+    repair_message = ""
+    if (
+        repair_boundaries
+        and batch_size > 0
+        and word_timestamps
+        and isinstance(transcriber, BatchedInferencePipeline)
+    ):
+        batched_segments = segments
+        try:
+            segments, repair_stats = repair_batched_boundaries(
+                transcriber,
+                audio,
+                segments,
+                language=language,
+                beam_size=beam_size,
+                window_workers=positive_env_integer("BOUNDARY_REPAIR_WORKERS", 2),
+            )
+            repair_message = (
+                "boundary_repair="
+                f"{repair_stats.words_added} words/{repair_stats.spans_added} spans/"
+                f"{repair_stats.windows_decoded} selected/{repair_stats.boundaries} boundaries/"
+                f"{repair_stats.elapsed_seconds:.1f}s"
+            )
+            print(f"  [reparación de límites] {repair_message}", flush=True)
+        except Exception as exc:
+            segments = batched_segments
+            repair_message = f"boundary_repair_failed={type(exc).__name__}: {exc}"
+            print(
+                "  [advertencia: reparación de límites] " + repair_message,
+                file=sys.stderr,
+                flush=True,
+            )
     write_outputs(audio, root, out_root, info, segments)
     elapsed = time.perf_counter() - started
     return {
@@ -155,7 +214,7 @@ def transcribe_one(
         "seconds": f"{elapsed:.1f}",
         "duration": f"{info.duration:.1f}",
         "language": info.language,
-        "message": "",
+        "message": repair_message,
     }
 
 
@@ -176,6 +235,11 @@ def main() -> int:
     parser.add_argument("--beam-size", type=int, default=5)
     parser.add_argument("--word-timestamps", action="store_true")
     parser.add_argument("--disable-vad", action="store_true")
+    parser.add_argument(
+        "--disable-boundary-repair",
+        action="store_true",
+        help="Desactiva la reparación localizada de límites en modo batched.",
+    )
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -251,6 +315,7 @@ def main() -> int:
                     batch_size=args.batch_size,
                     disable_vad=args.disable_vad,
                     word_timestamps=args.word_timestamps,
+                    repair_boundaries=not args.disable_boundary_repair,
                 )
                 info_duration = float(row["duration"])
                 elapsed = float(row["seconds"])

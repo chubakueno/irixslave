@@ -60,6 +60,17 @@ def getenv(env_file: dict[str, str], key: str, default: str | None = None, requi
     return value
 
 
+def nonnegative_config_integer(env_file: dict[str, str], key: str, default: int) -> int:
+    raw = getenv(env_file, key, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as error:
+        raise SystemExit(f"{key} debe ser un entero no negativo; recibido: {raw!r}") from error
+    if value < 0:
+        raise SystemExit(f"{key} debe ser un entero no negativo; recibido: {value}")
+    return value
+
+
 @dataclass
 class Config:
     base_url: str
@@ -73,18 +84,23 @@ class Config:
     diarization_engine: str
     device: str
     language: str
+    whisper_batch_size: int
     models_dir: Path
     results_dir: Path
 
 
 def load_config(poll_interval_override: float | None) -> Config:
     env_file = load_dotenv(ENV_PATH)
-    # diarizar.py busca el token de Hugging Face en el entorno real (HF_TOKEN /
-    # HUGGING_FACE_HUB_TOKEN) antes de caer al caché de "hf auth login". Si vino
-    # por .env en vez de por una variable ya exportada, lo exportamos aquí para
-    # que tanto el subproceso de pipeline_transcripcion_diarizada.py como el
-    # motor persistente (que importa diarizar.py en el mismo proceso) lo vean.
-    for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+    # Los motores persistentes leen estas opciones desde el entorno real. Si
+    # vinieron por .env, se exportan antes de importar motor_persistente.
+    for key in (
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "WHISPER_DEVICE_INDEX",
+        "WHISPER_NUM_WORKERS",
+        "BOUNDARY_REPAIR_WORKERS",
+        "BOUNDARY_REPAIR_ENABLED",
+    ):
         value = env_file.get(key)
         if value and not os.environ.get(key):
             os.environ[key] = value
@@ -115,9 +131,19 @@ def load_config(poll_interval_override: float | None) -> Config:
     else:
         default_worker_id = f"worker-{socket.gethostname()}"
         default_transcription_engine = "faster-whisper"
-        default_whisper_model = "large-v3"
+        local_whisper_model = PACKAGE_ROOT / "modelos" / "large-v3-local"
+        default_whisper_model = (
+            str(local_whisper_model) if local_whisper_model.is_dir() else "large-v3"
+        )
         default_diarization_engine = "pyannote"
         default_device = "cuda"
+
+    local_pyannote_model = PACKAGE_ROOT / "modelos" / "pyannote-community-1"
+    default_pyannote_model = (
+        str(local_pyannote_model)
+        if local_pyannote_model.is_dir()
+        else "pyannote/speaker-diarization-community-1"
+    )
 
     return Config(
         base_url=getenv(env_file, "RADIO_BASE_URL", "https://radio.datadaf.com").rstrip("/"),
@@ -127,10 +153,15 @@ def load_config(poll_interval_override: float | None) -> Config:
         heartbeat_interval=float(getenv(env_file, "HEARTBEAT_INTERVAL_SECONDS", "30")),
         whisper_model=getenv(env_file, "WHISPER_MODEL", default_whisper_model),
         transcription_engine=getenv(env_file, "TRANSCRIPTION_ENGINE", default_transcription_engine),
-        pyannote_model=getenv(env_file, "PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1"),
+        pyannote_model=getenv(env_file, "PYANNOTE_MODEL", default_pyannote_model),
         diarization_engine=getenv(env_file, "DIARIZATION_ENGINE", default_diarization_engine),
         device=getenv(env_file, "DEVICE", default_device),
         language=getenv(env_file, "TRANSCRIPTION_LANGUAGE", "es"),
+        # 0 usa Whisper secuencial dentro de cada job. Es el perfil de
+        # integridad validado contra la muestra M20; la cola remota mantiene
+        # la concurrencia entre workers/equipos. Un valor > 0 conserva el
+        # perfil BatchedInferencePipeline con reparación de límites.
+        whisper_batch_size=nonnegative_config_integer(env_file, "WHISPER_BATCH_SIZE", 0),
         models_dir=PACKAGE_ROOT / "modelos",
         results_dir=PACKAGE_ROOT / "resultados_worker",
     )
@@ -167,30 +198,82 @@ def send_heartbeat(session: requests.Session, cfg: Config, job_id: str, lease_id
     resp.raise_for_status()
 
 
+REMOTE_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+COMPLETE_MAX_ATTEMPTS = 4
+FAIL_MAX_ATTEMPTS = 3
+DOWNLOAD_MAX_ATTEMPTS = 3
+REMOTE_RETRY_DELAYS = (2.0, 5.0, 10.0)
+
+
+def is_retryable_request_error(exc: requests.RequestException) -> bool:
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    response = getattr(exc, "response", None)
+    return response is not None and response.status_code in REMOTE_RETRYABLE_STATUS
+
+
+def post_with_retry(
+    session: requests.Session,
+    url: str,
+    *,
+    headers: dict[str, str],
+    json_payload: dict[str, Any],
+    timeout: float,
+    max_attempts: int,
+    operation: str,
+) -> None:
+    if max_attempts < 1:
+        raise ValueError("max_attempts debe ser positivo")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = session.post(
+                url,
+                headers=headers,
+                json=json_payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return
+        except requests.RequestException as exc:
+            if attempt >= max_attempts or not is_retryable_request_error(exc):
+                raise
+            delay = REMOTE_RETRY_DELAYS[min(attempt - 1, len(REMOTE_RETRY_DELAYS) - 1)]
+            print(
+                f"  [{operation}] error transitorio en intento {attempt}/{max_attempts}: "
+                f"{type(exc).__name__}; reintento en {delay:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+
+
 def complete_job(session: requests.Session, cfg: Config, job_id: str, lease_id: str, payload: dict[str, Any]) -> None:
-    resp = session.post(
+    post_with_retry(
+        session,
         f"{cfg.base_url}/api/internal/transcription/jobs/{job_id}/complete",
         headers=api_headers(cfg, lease_id),
-        json=payload,
+        json_payload=payload,
         timeout=60,
+        max_attempts=COMPLETE_MAX_ATTEMPTS,
+        operation=f"{job_id} complete",
     )
-    resp.raise_for_status()
 
 
 def fail_job(session: requests.Session, cfg: Config, job_id: str, lease_id: str, error: str, retryable: bool) -> None:
-    resp = session.post(
+    post_with_retry(
+        session,
         f"{cfg.base_url}/api/internal/transcription/jobs/{job_id}/fail",
         headers=api_headers(cfg, lease_id),
-        json={"error": error, "retryable": retryable},
+        json_payload={"error": error, "retryable": retryable},
         timeout=30,
+        max_attempts=FAIL_MAX_ATTEMPTS,
+        operation=f"{job_id} fail",
     )
-    resp.raise_for_status()
 
 
 class HeartbeatThread(threading.Thread):
-    def __init__(self, session: requests.Session, cfg: Config, job_id: str, lease_id: str, interval: float) -> None:
+    def __init__(self, cfg: Config, job_id: str, lease_id: str, interval: float) -> None:
         super().__init__(daemon=True)
-        self._session = session
         self._cfg = cfg
         self._job_id = job_id
         self._lease_id = lease_id
@@ -198,12 +281,13 @@ class HeartbeatThread(threading.Thread):
         self._stop = threading.Event()
 
     def run(self) -> None:
-        while not self._stop.wait(self._interval):
-            try:
-                send_heartbeat(self._session, self._cfg, self._job_id, self._lease_id)
-                print(f"  [{self._job_id}] [heartbeat OK {datetime.now().strftime('%H:%M:%S')}]")
-            except Exception as exc:
-                print(f"  [{self._job_id}] [heartbeat ERROR: {exc}]", file=sys.stderr)
+        with requests.Session() as session:
+            while not self._stop.wait(self._interval):
+                try:
+                    send_heartbeat(session, self._cfg, self._job_id, self._lease_id)
+                    print(f"  [{self._job_id}] [heartbeat OK {datetime.now().strftime('%H:%M:%S')}]")
+                except Exception as exc:
+                    print(f"  [{self._job_id}] [heartbeat ERROR: {exc}]", file=sys.stderr)
 
     def stop(self) -> None:
         self._stop.set()
@@ -321,16 +405,33 @@ def wait_until_readable(path: Path, attempts: int = 6, initial_delay: float = 0.
 
 def download_audio(session: requests.Session, url: str, headers: dict[str, str], dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
-    with session.get(url, headers=headers or {}, stream=True, timeout=120) as resp:
-        resp.raise_for_status()
-        suffix = guess_suffix(url, resp.headers.get("Content-Type"))
-        dest = dest_dir / f"audio{suffix}"
-        with dest.open("wb") as fh:
-            for chunk in resp.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    fh.write(chunk)
-    wait_until_readable(dest)
-    return dest
+    for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
+        destination: Path | None = None
+        try:
+            with session.get(url, headers=headers or {}, stream=True, timeout=120) as resp:
+                resp.raise_for_status()
+                suffix = guess_suffix(url, resp.headers.get("Content-Type"))
+                destination = dest_dir / f"audio{suffix}"
+                with destination.open("wb") as handle:
+                    for chunk in resp.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            handle.write(chunk)
+            wait_until_readable(destination)
+            return destination
+        except requests.RequestException as exc:
+            if destination is not None and destination.is_file():
+                destination.unlink()
+            if attempt >= DOWNLOAD_MAX_ATTEMPTS or not is_retryable_request_error(exc):
+                raise
+            delay = REMOTE_RETRY_DELAYS[min(attempt - 1, len(REMOTE_RETRY_DELAYS) - 1)]
+            print(
+                f"  [descarga] error transitorio en intento {attempt}/{DOWNLOAD_MAX_ATTEMPTS}: "
+                f"{type(exc).__name__}; reintento en {delay:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+    raise RuntimeError("download_audio agotó intentos sin devolver ni lanzar error")
 
 
 def run_local_pipeline(cfg: Config, audio_path: Path, out_dir: Path) -> None:
@@ -346,6 +447,7 @@ def run_local_pipeline(cfg: Config, audio_path: Path, out_dir: Path) -> None:
         "--pyannote-model", cfg.pyannote_model,
         "--diarization-engine", cfg.diarization_engine,
         "--models-dir", str(cfg.models_dir),
+        "--batch-size", str(cfg.whisper_batch_size),
     ]
     completed = subprocess.run(command, cwd=PACKAGE_ROOT)
     if completed.returncode != 0:
@@ -439,7 +541,7 @@ def prepare_job(cfg: Config, live: bool) -> PreparedJob | None:
         )
         return None
 
-    heartbeat = HeartbeatThread(session, cfg, job_id, lease_id, cfg.heartbeat_interval)
+    heartbeat = HeartbeatThread(cfg, job_id, lease_id, cfg.heartbeat_interval)
     heartbeat.start()
 
     WORKER_TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -479,6 +581,7 @@ def process_prepared_job(cfg: Config, prepared: PreparedJob, live: bool, engine:
     job_id = prepared.job_id
     lease_id = prepared.lease_id
     session = prepared.session
+    local_result_ready = False
 
     print(f"\n=== Job {job_id} (lease {lease_id}) ===")
     try:
@@ -522,6 +625,7 @@ def process_prepared_job(cfg: Config, prepared: PreparedJob, live: bool, engine:
         cfg.results_dir.mkdir(parents=True, exist_ok=True)
         result_path = cfg.results_dir / f"{job_id}.json"
         result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        local_result_ready = True
         print(f"  resultado guardado en: {result_path}")
 
         if not live:
@@ -534,12 +638,18 @@ def process_prepared_job(cfg: Config, prepared: PreparedJob, live: bool, engine:
     except Exception as exc:
         print(f"  ERROR: {exc}", file=sys.stderr)
         traceback.print_exc()
-        if live:
+        if live and not local_result_ready:
             try:
                 fail_job(session, cfg, job_id, lease_id, str(exc), retryable=True)
                 print("  reportado como fallido (fail, retryable=true).")
             except Exception as fail_exc:
                 print(f"  no se pudo reportar el fallo a la API: {fail_exc}", file=sys.stderr)
+        elif live:
+            print(
+                "  resultado local completo conservado; no se envía /fail porque "
+                "la confirmación de /complete es incierta.",
+                file=sys.stderr,
+            )
         raise
     finally:
         prepared.heartbeat.stop()
@@ -585,8 +695,10 @@ def main() -> int:
         from motor_persistente import PersistentEngine
 
         compute_type = "int8_float16" if cfg.device == "cuda" else "int8"
-        batch_size = 12 if cfg.device == "cuda" else 0
+        batch_size = cfg.whisper_batch_size if cfg.device == "cuda" else 0
+        whisper_profile = "secuencial" if batch_size == 0 else f"batch={batch_size}"
         print("Cargando modelos en memoria (whisper + pyannote)...")
+        print(f"  Perfil Whisper: {whisper_profile}")
         engine = PersistentEngine(
             whisper_model=cfg.whisper_model,
             device=cfg.device,
