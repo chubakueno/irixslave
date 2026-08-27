@@ -378,7 +378,8 @@ def load_pipeline(
     print(f"DEVICE={device}")
     if device.type == "cuda":
         print(f"GPU={torch.cuda.get_device_name(0)}")
-        torch.set_float32_matmul_precision("high")
+        # pyannote fuerza allow_tf32=False en cada llamada (fix_reproducibility),
+        # así que no tiene sentido pedir "high" aquí: solo generaba un warning.
         torch.backends.cudnn.benchmark = True
 
     source = str(model_path.resolve()) if is_local_model else model
