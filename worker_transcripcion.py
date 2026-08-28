@@ -75,6 +75,10 @@ class Config:
     language: str
     models_dir: Path
     results_dir: Path
+    compute_type: str
+    whisper_batch_size: int
+    segmentation_batch_size: int
+    embedding_batch_size: int
 
 
 def load_config(poll_interval_override: float | None) -> Config:
@@ -133,6 +137,11 @@ def load_config(poll_interval_override: float | None) -> Config:
         language=getenv(env_file, "TRANSCRIPTION_LANGUAGE", "es"),
         models_dir=PACKAGE_ROOT / "modelos",
         results_dir=PACKAGE_ROOT / "resultados_worker",
+        # Vacío => se deriva por dispositivo (int8_float16 en CUDA, int8 en CPU).
+        compute_type=getenv(env_file, "COMPUTE_TYPE", ""),
+        whisper_batch_size=int(getenv(env_file, "WHISPER_BATCH_SIZE", "12")),
+        segmentation_batch_size=int(getenv(env_file, "PYANNOTE_SEGMENTATION_BATCH_SIZE", "6")),
+        embedding_batch_size=int(getenv(env_file, "PYANNOTE_EMBEDDING_BATCH_SIZE", "16")),
     )
 
 
@@ -346,7 +355,12 @@ def run_local_pipeline(cfg: Config, audio_path: Path, out_dir: Path) -> None:
         "--pyannote-model", cfg.pyannote_model,
         "--diarization-engine", cfg.diarization_engine,
         "--models-dir", str(cfg.models_dir),
+        "--batch-size", str(cfg.whisper_batch_size),
+        "--segmentation-batch-size", str(cfg.segmentation_batch_size),
+        "--embedding-batch-size", str(cfg.embedding_batch_size),
     ]
+    if cfg.compute_type:
+        command += ["--compute-type", cfg.compute_type]
     completed = subprocess.run(command, cwd=PACKAGE_ROOT)
     if completed.returncode != 0:
         raise RuntimeError(f"pipeline_transcripcion_diarizada.py terminó con código {completed.returncode}")
@@ -584,8 +598,10 @@ def main() -> int:
             )
         from motor_persistente import PersistentEngine
 
-        compute_type = "int8_float16" if cfg.device == "cuda" else "int8"
-        batch_size = 12 if cfg.device == "cuda" else 0
+        compute_type = cfg.compute_type or (
+            "int8_float16" if cfg.device == "cuda" else "int8"
+        )
+        batch_size = cfg.whisper_batch_size if cfg.device == "cuda" else 0
         print("Cargando modelos en memoria (whisper + pyannote)...")
         engine = PersistentEngine(
             whisper_model=cfg.whisper_model,
@@ -595,6 +611,8 @@ def main() -> int:
             batch_size=batch_size,
             beam_size=1,
             pyannote_model=cfg.pyannote_model,
+            segmentation_batch_size=cfg.segmentation_batch_size,
+            embedding_batch_size=cfg.embedding_batch_size,
         )
 
     stop_requested = threading.Event()

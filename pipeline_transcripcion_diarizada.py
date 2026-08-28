@@ -67,6 +67,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models-dir", type=Path)
     parser.add_argument("--beam-size", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=12)
+    parser.add_argument(
+        "--compute-type",
+        help=(
+            "Tipo de cómputo de Faster-Whisper (ej. int8_float16, float16, int8). "
+            "Predeterminado: int8_float16 en CUDA, int8 en CPU."
+        ),
+    )
+    parser.add_argument(
+        "--segmentation-batch-size",
+        type=int,
+        default=6,
+        help="Lote de la segmentación de Pyannote (solo --diarization-engine pyannote).",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=16,
+        help="Lote de los embeddings de Pyannote (solo --diarization-engine pyannote).",
+    )
     parser.add_argument("--num-speakers", type=int)
     parser.add_argument("--min-speakers", type=int)
     parser.add_argument("--max-speakers", type=int)
@@ -271,7 +290,9 @@ def main() -> int:
     file_list = output_root / "_archivos_entrada.txt"
     write_input_list(audio_root, audio_files, file_list)
     env = runtime_environment(output_root)
-    compute_type = "int8_float16" if args.device == "cuda" else "int8"
+    compute_type = args.compute_type or (
+        "int8_float16" if args.device == "cuda" else "int8"
+    )
     batch_size = args.batch_size if args.device == "cuda" else 0
 
     if not args.skip_transcription:
@@ -359,9 +380,9 @@ def main() -> int:
                 "--device",
                 args.device,
                 "--segmentation-batch-size",
-                "6",
+                str(args.segmentation_batch_size),
                 "--embedding-batch-size",
-                "16",
+                str(args.embedding_batch_size),
             ]
             if args.device == "cpu":
                 command.append("--allow-cpu")

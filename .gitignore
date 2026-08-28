@@ -4,6 +4,8 @@ resultado/
 resultados/
 resultados_worker/
 .worker_tmp/
+muestra_datadaf/
+resultados_clasificador/
 __pycache__/
 *.log
 *.pid
