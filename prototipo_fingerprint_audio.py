@@ -44,12 +44,26 @@ CLUSTER_GAP_SECONDS = 5.0  # separacion maxima entre hashes consecutivos para se
 MAX_PAIRS_PER_OCCURRENCE = 20
 
 
+def _ignore_invalid_frames(frames):
+    """Salta paquetes corruptos en vez de abortar (capturas de streams
+    SHOUTcast/Icecast suelen traer algún frame roto). Igual criterio que
+    faster_whisper.audio y scripts_originales/diarizar.py."""
+    iterator = iter(frames)
+    while True:
+        try:
+            yield next(iterator)
+        except StopIteration:
+            break
+        except av.error.InvalidDataError:
+            continue
+
+
 def load_audio_mono(path: Path, sr: int) -> np.ndarray:
-    container = av.open(str(path), metadata_errors="replace")
+    container = av.open(str(path), metadata_errors="ignore")
     stream = container.streams.audio[0]
     resampler = av.AudioResampler(format="flt", layout="mono", rate=sr)
     chunks = []
-    for frame in container.decode(stream):
+    for frame in _ignore_invalid_frames(container.decode(stream)):
         for r in resampler.resample(frame):
             chunks.append(r.to_ndarray())
     for r in resampler.resample(None):

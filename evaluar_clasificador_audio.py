@@ -25,12 +25,25 @@ HOP_SECONDS = 5.0
 LABELS_OF_INTEREST = ("Speech", "Music", "Singing")
 
 
+def _ignore_invalid_frames(frames):
+    """Salta paquetes corruptos en vez de abortar (capturas de streams
+    SHOUTcast/Icecast suelen traer algún frame roto)."""
+    iterator = iter(frames)
+    while True:
+        try:
+            yield next(iterator)
+        except StopIteration:
+            break
+        except av.error.InvalidDataError:
+            continue
+
+
 def load_audio_mono16k(path: Path) -> np.ndarray:
-    container = av.open(str(path), metadata_errors="replace")
+    container = av.open(str(path), metadata_errors="ignore")
     stream = container.streams.audio[0]
     resampler = av.AudioResampler(format="s16", layout="mono", rate=TARGET_SR)
     chunks = []
-    for frame in container.decode(stream):
+    for frame in _ignore_invalid_frames(container.decode(stream)):
         for resampled in resampler.resample(frame):
             chunks.append(resampled.to_ndarray())
     for resampled in resampler.resample(None):
