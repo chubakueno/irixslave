@@ -38,7 +38,10 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PACKAGE_ROOT / "scripts_originales"))
 from transcribir import load_model  # noqa: E402
 
-DEFAULT_COMPUTE_TYPES = "int8_float16,float16,int8"
+# Un solo compute_type por defecto: cada uno adicional obliga a recargar el
+# modelo (compute_type se fija al construir el WhisperModel y la cuantización
+# float16->int8 se rehace en RAM). Pasá varios solo si querés comparar formatos.
+DEFAULT_COMPUTE_TYPES = "int8_float16"
 DEFAULT_BATCH_SIZES = "8,16,24,32"
 DEFAULT_BEAM_SIZES = "1"
 
@@ -82,6 +85,7 @@ def main() -> int:
     parser.add_argument("--language", default="es")
     parser.add_argument("--model-dir", type=Path, default=PACKAGE_ROOT / "modelos" / "whisper")
     parser.add_argument("--no-word-timestamps", action="store_true", help="Más rápido, pero no es lo que corre producción.")
+    parser.add_argument("--repeat", type=int, default=1, help="Corre cada combo N veces (para ver varianza). Predeterminado: 1.")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -123,7 +127,7 @@ def main() -> int:
 
     baseline_text: str | None = None
 
-    def run(compute_type: str, transcriber, batch_size: int, beam_size: int, *, report: bool = True) -> None:
+    def run(compute_type: str, transcriber, batch_size: int, beam_size: int, *, report: bool = True, tag: str = "") -> None:
         nonlocal baseline_text
         options = transcribe_options(args.language, beam_size, batch_size, word_timestamps)
         if not report:
@@ -146,20 +150,22 @@ def main() -> int:
             else:
                 sim = difflib.SequenceMatcher(None, baseline_text, text).ratio()
             print(
-                f"{compute_type:13s} batch={batch_size:3d} beam={beam_size:d}   "
+                f"{compute_type:13s} batch={batch_size:3d} beam={beam_size:d} {tag:5s}  "
                 f"{elapsed:6.2f}s  RTF={duration / elapsed:6.1f}x   "
                 f"seg={len(segments):4d}  chars={n_chars:6d}  logprob={mean_lp:+.3f}  sim={sim:.3f}  "
                 f"peakVRAM={peak:4.1f}GB",
                 flush=True,
             )
         except Exception as exc:  # noqa: BLE001 - seguir con el resto del barrido
-            print(f"{compute_type:13s} batch={batch_size:3d} beam={beam_size:d}   FALLO {type(exc).__name__}: {str(exc)[:150]}", flush=True)
+            print(f"{compute_type:13s} batch={batch_size:3d} beam={beam_size:d} {tag:5s}  FALLO {type(exc).__name__}: {str(exc)[:150]}", flush=True)
         finally:
             torch.cuda.empty_cache()
 
     try:
-        for compute_type in compute_types:
-            print(f"--- cargando modelo con compute_type={compute_type} ---", flush=True)
+        for i, compute_type in enumerate(compute_types):
+            n = len(compute_types)
+            extra = "" if n == 1 else f"  ({i + 1}/{n} — recarga: compute_type se fija al construir el modelo)"
+            print(f"--- cargando modelo con compute_type={compute_type}{extra} ---", flush=True)
             try:
                 transcriber = load_model(args.model, "cuda", compute_type, args.model_dir, batch_size=max(batch_sizes))
             except Exception as exc:  # noqa: BLE001
@@ -169,7 +175,9 @@ def main() -> int:
             run(compute_type, transcriber, batch_sizes[0], beam_sizes[0], report=False)
             for beam_size in beam_sizes:
                 for batch_size in batch_sizes:
-                    run(compute_type, transcriber, batch_size, beam_size)
+                    for r in range(max(1, args.repeat)):
+                        run(compute_type, transcriber, batch_size, beam_size,
+                            tag=f"#{r + 1}" if args.repeat > 1 else "")
             del transcriber
             torch.cuda.empty_cache()
     finally:

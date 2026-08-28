@@ -69,6 +69,7 @@ def main() -> int:
     parser.add_argument("--combos", default=DEFAULT_COMBOS, help=f'Lista "segXemb" separada por comas. Predeterminado: "{DEFAULT_COMBOS}"')
     parser.add_argument("--model", default=MODEL_ID)
     parser.add_argument("--cache-dir", type=Path, default=PACKAGE_ROOT / "modelos" / "pyannote-cache")
+    parser.add_argument("--repeat", type=int, default=1, help="Corre cada combo N veces (para ver varianza). Predeterminado: 1.")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -92,7 +93,7 @@ def main() -> int:
     print(f"combos  : {', '.join(f'{s}x{e}' for s, e in combos)}")
     print()
 
-    def run(seg: int, emb: int) -> None:
+    def run(seg: int, emb: int, tag: str = "") -> None:
         pipeline.segmentation_batch_size = seg
         pipeline.embedding_batch_size = emb
         torch.cuda.reset_peak_memory_stats()
@@ -105,12 +106,12 @@ def main() -> int:
             n_spk = len(result.speaker_diarization.labels())
             peak = torch.cuda.max_memory_allocated() / 1e9
             print(
-                f"seg={seg:3d} emb={emb:3d}   {elapsed:6.2f}s   "
+                f"seg={seg:3d} emb={emb:3d} {tag:5s}  {elapsed:6.2f}s   "
                 f"RTF={duration / elapsed:6.1f}x   n_spk={n_spk:2d}   peakVRAM={peak:4.1f}GB",
                 flush=True,
             )
         except Exception as exc:  # noqa: BLE001 - queremos seguir con el resto del barrido
-            print(f"seg={seg:3d} emb={emb:3d}   FALLO {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+            print(f"seg={seg:3d} emb={emb:3d} {tag:5s}  FALLO {type(exc).__name__}: {str(exc)[:160]}", flush=True)
         finally:
             torch.cuda.empty_cache()
 
@@ -120,7 +121,8 @@ def main() -> int:
     print()
 
     for seg, emb in combos:
-        run(seg, emb)
+        for r in range(max(1, args.repeat)):
+            run(seg, emb, f"#{r + 1}" if args.repeat > 1 else "")
 
     print()
     print("Elegí el mejor RTF cuyo n_spk sea igual al de la primera fila.")

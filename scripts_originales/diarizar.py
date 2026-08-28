@@ -67,6 +67,21 @@ def safe_uri(relative_path: Path) -> str:
     return f"{stem[:48]}_{digest}"
 
 
+def _ignore_invalid_frames(frames):
+    """Salta paquetes con datos corruptos en vez de abortar la decodificación.
+    Igual que faster_whisper.audio._ignore_invalid_frames: las capturas de
+    streams SHOUTcast/Icecast suelen tener algún frame roto por un glitch de red
+    del lado del grabador, y ffmpeg/faster-whisper lo saltan y siguen."""
+    iterator = iter(frames)
+    while True:
+        try:
+            yield next(iterator)
+        except StopIteration:
+            break
+        except av.error.InvalidDataError:
+            continue
+
+
 def load_audio(path: Path, max_seconds: float | None = None) -> torch.Tensor:
     max_samples = round(max_seconds * SAMPLE_RATE) if max_seconds else None
     chunks: list[np.ndarray] = []
@@ -75,11 +90,11 @@ def load_audio(path: Path, max_seconds: float | None = None) -> torch.Tensor:
         format="s16", layout="mono", rate=SAMPLE_RATE
     )
 
-    with av.open(str(path), metadata_errors="replace") as container:
+    with av.open(str(path), metadata_errors="ignore") as container:
         if not container.streams.audio:
             raise RuntimeError("El archivo no contiene una pista de audio.")
         stream = container.streams.audio[0]
-        for frame in container.decode(stream):
+        for frame in _ignore_invalid_frames(container.decode(stream)):
             converted = resampler.resample(frame)
             for output_frame in converted if isinstance(converted, list) else [converted]:
                 if output_frame is None:
