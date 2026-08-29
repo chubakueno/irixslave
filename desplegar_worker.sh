@@ -11,6 +11,8 @@
 #           corre en dry-run (procesa y guarda local, no toca la cola de jobs).
 #   --solo-instalar: copia el código e instala dependencias, pero NO arranca
 #           el worker. Útil para dejar la instancia lista y correrla a mano.
+#   --transcription-only / --diarization-only / --capabilities=<lista>: limita
+#           qué salidas toma el worker de la cola (default: ambas).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -22,12 +24,15 @@ fi
 HOST="$1"
 PORT="$2"
 LIVE_FLAG=""
+WORKER_EXTRA=""
 START_WORKER=1
 shift 2
 for arg in "$@"; do
   case "$arg" in
     --live) LIVE_FLAG="--live" ;;
     --solo-instalar|--no-arrancar) START_WORKER=0 ;;
+    --transcription-only|--diarization-only) WORKER_EXTRA="$WORKER_EXTRA $arg" ;;
+    --capabilities=*) WORKER_EXTRA="$WORKER_EXTRA $arg" ;;
     *) echo "Bandera desconocida: $arg" >&2; exit 1 ;;
   esac
 done
@@ -72,13 +77,13 @@ if [ "$START_WORKER" -eq 0 ]; then
   echo
   echo "Listo (solo instalación). El worker NO se arrancó."
   echo "Para arrancarlo a mano:"
-  echo "  ssh -p $PORT root@$HOST -t \"cd $REMOTE_DIR && tmux new-session -s worker './.venv/bin/python worker_transcripcion.py --persistent-models $LIVE_FLAG'\""
+  echo "  ssh -p $PORT root@$HOST -t \"cd $REMOTE_DIR && tmux new-session -s worker './.venv/bin/python worker_transcripcion.py --persistent-models$WORKER_EXTRA $LIVE_FLAG'\""
   exit 0
 fi
 
 echo "Arrancando el worker dentro de tmux..."
 ssh "${SSH_OPTS[@]}" "root@$HOST" \
-  "cd $REMOTE_DIR && tmux new-session -d -s worker \"./.venv/bin/python worker_transcripcion.py --persistent-models $LIVE_FLAG\""
+  "cd $REMOTE_DIR && tmux new-session -d -s worker \"./.venv/bin/python worker_transcripcion.py --persistent-models$WORKER_EXTRA $LIVE_FLAG\""
 
 echo
 echo "Listo. Modo: $([ -n "$LIVE_FLAG" ] && echo LIVE || echo DRY-RUN)"

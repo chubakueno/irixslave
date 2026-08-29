@@ -1,5 +1,10 @@
 param(
-    [switch]$Live
+    [switch]$Live,
+    # Banderas extra que se pasan tal cual a worker_transcripcion.py, p.ej.
+    #   .\correr_worker.ps1 -Live --transcription-only
+    #   .\correr_worker.ps1 --persistent-models --diarization-only
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Rest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,11 +38,10 @@ Write-Host "Worker corriendo (el sistema no se suspenderá mientras esta ventana
 Write-Host "Presiona Ctrl+C para detener."
 
 try {
-    if ($Live) {
-        & $python (Join-Path $PSScriptRoot 'worker_transcripcion.py') --live
-    } else {
-        & $python (Join-Path $PSScriptRoot 'worker_transcripcion.py')
-    }
+    $workerArgs = @(Join-Path $PSScriptRoot 'worker_transcripcion.py')
+    if ($Live) { $workerArgs += '--live' }
+    if ($Rest) { $workerArgs += $Rest }
+    & $python @workerArgs
 } finally {
     [SleepBlocker]::SetThreadExecutionState([SleepBlocker]::ES_CONTINUOUS) | Out-Null
 }

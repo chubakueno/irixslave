@@ -279,7 +279,65 @@ Para usar el pipeline 100% PyTorch original (útil para comparar, o si `speech` 
    ./.venv/bin/python worker_transcripcion.py --live             # loop continuo
    ```
 
-Cada job renueva el lease con un heartbeat cada 30 s mientras se procesa (margen de seguridad frente al TTL del lease en el backend, para que no se rehabilite el job para otro worker). El campo `text` que se sube queda formateado como `[SPEAKER_00] texto...` por turno, y cada `word` incluye `text`, `start`, `end`, `type: "word"`, `speaker_id` y `logprob` (derivado de la probabilidad de Whisper).
+### Capacidades: transcripción, diarización o ambas
+
+El worker negocia con la cola vía `POST /api/internal/jobs/lease`, anunciando qué
+salidas sabe producir (`{"capabilities": ["transcription", "diarization"]}`). La
+API le entrega jobs con `requested_outputs` que pueden ser `["transcription"]`,
+`["diarization"]` o ambas, y el worker corre solo las etapas pedidas.
+
+Por defecto anuncia las dos. Para dedicar una máquina a una sola:
+
+```bash
+./.venv/bin/python worker_transcripcion.py --transcription-only --live
+./.venv/bin/python worker_transcripcion.py --diarization-only --live
+./.venv/bin/python worker_transcripcion.py --capabilities transcription,diarization
+```
+
+o de forma persistente en `.env`: `WORKER_CAPABILITIES=transcription`. Con
+`--persistent-models`, un worker de una sola capacidad carga únicamente ese
+modelo (no paga VRAM ni arranque del otro).
+
+### Formato del resultado
+
+Cada job renueva el lease con un heartbeat cada 30 s mientras se procesa (margen
+de seguridad frente al TTL del lease en el backend, para que no se rehabilite el
+job para otro worker). Al terminar se sube a
+`POST /api/internal/jobs/audio-processing/:job_id/complete`.
+
+Para no dejar la GPU ociosa entre jobs, mientras el hilo principal procesa un
+job un único hilo de fondo (`advance`) hace, en orden, todo lo que no usa GPU:
+(1) sube a `/complete` el resultado del job anterior y libera sus recursos, (2)
+pide el siguiente lease y (3) pre-descarga su MP3. Así el POST (que puede ser de
+varios MB) se solapa con el cómputo del job siguiente, y el lease de un job nuevo
+**no se pide hasta que la subida del anterior haya terminado** (van seguidos en
+el mismo hilo). Son solo 2 hilos y el worker sostiene como mucho **2 leases** a
+la vez: el que procesa + el que `advance` esté tocando en ese instante (subiendo
+o leaseando, nunca ambos). Al detenerlo (`q`, o sin trabajos con `--once`) espera
+a que termine la subida en curso.
+
+Forma del payload:
+
+```jsonc
+{
+  "outputs": {
+    "transcription": {           // si se pidió "transcription"
+      "text": "...",             // por turno "[SPEAKER_00] ..." si hubo diarización; si no, un segmento de Whisper por línea
+      "language": "es",
+      "model": "whisper-large-v3",
+      "words": [ { "text", "start", "end", "type": "word", "speaker_id"?, "logprob"? } ]
+    },
+    "diarization": {             // si se pidió "diarization"
+      "model": "pyannote/speaker-diarization-community-1",
+      "segments": [ { "speaker_id", "start", "end", "text"? } ],  // "text" solo cuando también hubo transcripción
+      "metadata": { "speaker_count": 2, "processing_time_ms": 12000 }
+    }
+  }
+}
+```
+
+En jobs de solo diarización los `segments` son los intervalos **exclusivos** (un
+hablante por instante, sin solapamiento).
 
 Para correr el worker en loop continuo sin que el equipo se suspenda:
 ```bash
@@ -289,6 +347,7 @@ Para correr el worker en loop continuo sin que el equipo se suspenda:
 ```powershell
 .\correr_worker.ps1          # Windows, dry-run
 .\correr_worker.ps1 -Live    # Windows, sube resultados reales
+.\correr_worker.ps1 -Live --transcription-only   # banderas extra pasan tal cual al worker
 ```
 Ninguno cambia la configuración de energía del sistema de forma permanente — solo evitan la suspensión mientras ese proceso/ventana sigue abierto (`caffeinate -s` en macOS, `SetThreadExecutionState` en Windows).
 

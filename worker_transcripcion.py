@@ -25,6 +25,44 @@ IS_MACOS = platform.system() == "Darwin"
 IS_WINDOWS = platform.system() == "Windows"
 STOP_KEY = b"q"
 
+_stdlib_print = print
+
+
+def print(*args: Any, **kwargs: Any) -> None:  # noqa: A001 -- sella cada log del worker con la hora
+    """Antepone `[HH:MM:SS]` a cada línea que imprime el worker, para que todos
+    los logs (no solo el heartbeat) lleven hora. Si el texto tiene saltos de
+    línea, sella cada una."""
+    stamp = datetime.now().strftime("%H:%M:%S")
+    sep = kwargs.get("sep", " ")
+    text = sep.join(str(a) for a in args)
+    stamped = "\n".join(f"[{stamp}] {line}" for line in text.split("\n"))
+    _stdlib_print(stamped, **{k: v for k, v in kwargs.items() if k != "sep"})
+
+# Salidas que este worker sabe producir. La API de jobs negocia por aquí: el
+# worker anuncia sus `capabilities` al pedir trabajo y solo recibe jobs cuyos
+# `requested_outputs` estén contenidos en ellas.
+TRANSCRIPTION = "transcription"
+DIARIZATION = "diarization"
+ALL_CAPABILITIES = (TRANSCRIPTION, DIARIZATION)
+
+
+def parse_capabilities(raw: str | None) -> list[str]:
+    """Convierte "transcription,diarization" (env o CLI) en una lista validada,
+    preservando el orden canónico de ALL_CAPABILITIES."""
+    if not raw:
+        return list(ALL_CAPABILITIES)
+    wanted = {item.strip().lower() for item in raw.split(",") if item.strip()}
+    unknown = wanted - set(ALL_CAPABILITIES)
+    if unknown:
+        raise SystemExit(
+            f"Capacidad(es) no reconocida(s): {', '.join(sorted(unknown))}. "
+            f"Válidas: {', '.join(ALL_CAPABILITIES)}."
+        )
+    if not wanted:
+        raise SystemExit("La lista de capacidades quedó vacía.")
+    return [item for item in ALL_CAPABILITIES if item in wanted]
+
+
 # Carpeta propia (en vez de %TEMP%) para los audios descargados por job. Así la
 # exclusión de Windows Defender puede apuntar a esta única carpeta en vez de a
 # todo %TEMP%, que comparten otros programas.
@@ -79,9 +117,13 @@ class Config:
     whisper_batch_size: int
     segmentation_batch_size: int
     embedding_batch_size: int
+    capabilities: list[str]
 
 
-def load_config(poll_interval_override: float | None) -> Config:
+def load_config(
+    poll_interval_override: float | None,
+    capabilities_override: list[str] | None = None,
+) -> Config:
     env_file = load_dotenv(ENV_PATH)
     # diarizar.py busca el token de Hugging Face en el entorno real (HF_TOKEN /
     # HUGGING_FACE_HUB_TOKEN) antes de caer al caché de "hf auth login". Si vino
@@ -106,6 +148,10 @@ def load_config(poll_interval_override: float | None) -> Config:
     poll_interval = poll_interval_override
     if poll_interval is None:
         poll_interval = float(getenv(env_file, "POLL_INTERVAL_SECONDS", "15"))
+
+    capabilities = capabilities_override or parse_capabilities(
+        getenv(env_file, "WORKER_CAPABILITIES", None)
+    )
 
     # Defaults por plataforma: en Apple Silicon usa los motores acelerados
     # (MLX/Soniqo); en Windows/Linux con NVIDIA cae al pipeline original
@@ -142,6 +188,7 @@ def load_config(poll_interval_override: float | None) -> Config:
         whisper_batch_size=int(getenv(env_file, "WHISPER_BATCH_SIZE", "12")),
         segmentation_batch_size=int(getenv(env_file, "PYANNOTE_SEGMENTATION_BATCH_SIZE", "6")),
         embedding_batch_size=int(getenv(env_file, "PYANNOTE_EMBEDDING_BATCH_SIZE", "16")),
+        capabilities=capabilities,
     )
 
 
@@ -155,10 +202,15 @@ def api_headers(cfg: Config, lease_id: str | None = None) -> dict[str, str]:
     return headers
 
 
+def job_action_url(cfg: Config, job_id: str, action: str) -> str:
+    return f"{cfg.base_url}/api/internal/jobs/audio-processing/{job_id}/{action}"
+
+
 def lease_job(session: requests.Session, cfg: Config) -> dict[str, Any] | None:
     resp = session.post(
-        f"{cfg.base_url}/api/internal/transcription/lease",
+        f"{cfg.base_url}/api/internal/jobs/lease",
         headers=api_headers(cfg),
+        json={"capabilities": cfg.capabilities},
         timeout=30,
     )
     if resp.status_code == 204:
@@ -169,7 +221,7 @@ def lease_job(session: requests.Session, cfg: Config) -> dict[str, Any] | None:
 
 def send_heartbeat(session: requests.Session, cfg: Config, job_id: str, lease_id: str) -> None:
     resp = session.post(
-        f"{cfg.base_url}/api/internal/transcription/jobs/{job_id}/heartbeat",
+        job_action_url(cfg, job_id, "heartbeat"),
         headers=api_headers(cfg, lease_id),
         timeout=15,
     )
@@ -178,7 +230,7 @@ def send_heartbeat(session: requests.Session, cfg: Config, job_id: str, lease_id
 
 def complete_job(session: requests.Session, cfg: Config, job_id: str, lease_id: str, payload: dict[str, Any]) -> None:
     resp = session.post(
-        f"{cfg.base_url}/api/internal/transcription/jobs/{job_id}/complete",
+        job_action_url(cfg, job_id, "complete"),
         headers=api_headers(cfg, lease_id),
         json=payload,
         timeout=60,
@@ -188,7 +240,7 @@ def complete_job(session: requests.Session, cfg: Config, job_id: str, lease_id: 
 
 def fail_job(session: requests.Session, cfg: Config, job_id: str, lease_id: str, error: str, retryable: bool) -> None:
     resp = session.post(
-        f"{cfg.base_url}/api/internal/transcription/jobs/{job_id}/fail",
+        job_action_url(cfg, job_id, "fail"),
         headers=api_headers(cfg, lease_id),
         json={"error": error, "retryable": retryable},
         timeout=30,
@@ -210,7 +262,7 @@ class HeartbeatThread(threading.Thread):
         while not self._stop.wait(self._interval):
             try:
                 send_heartbeat(self._session, self._cfg, self._job_id, self._lease_id)
-                print(f"  [{self._job_id}] [heartbeat OK {datetime.now().strftime('%H:%M:%S')}]")
+                print(f"  [{self._job_id}] heartbeat OK")
             except Exception as exc:
                 print(f"  [{self._job_id}] [heartbeat ERROR: {exc}]", file=sys.stderr)
 
@@ -342,7 +394,14 @@ def download_audio(session: requests.Session, url: str, headers: dict[str, str],
     return dest
 
 
-def run_local_pipeline(cfg: Config, audio_path: Path, out_dir: Path) -> None:
+def run_local_pipeline(
+    cfg: Config,
+    audio_path: Path,
+    out_dir: Path,
+    *,
+    want_transcription: bool,
+    want_diarization: bool,
+) -> None:
     command = [
         sys.executable,
         str(PACKAGE_ROOT / "pipeline_transcripcion_diarizada.py"),
@@ -359,6 +418,10 @@ def run_local_pipeline(cfg: Config, audio_path: Path, out_dir: Path) -> None:
         "--segmentation-batch-size", str(cfg.segmentation_batch_size),
         "--embedding-batch-size", str(cfg.embedding_batch_size),
     ]
+    if not want_transcription:
+        command.append("--skip-transcription")
+    if not want_diarization:
+        command.append("--skip-diarization")
     if cfg.compute_type:
         command += ["--compute-type", cfg.compute_type]
     completed = subprocess.run(command, cwd=PACKAGE_ROOT)
@@ -366,46 +429,159 @@ def run_local_pipeline(cfg: Config, audio_path: Path, out_dir: Path) -> None:
         raise RuntimeError(f"pipeline_transcripcion_diarizada.py terminó con código {completed.returncode}")
 
 
-def load_results(out_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    transcript_matches = [
-        p for p in (out_dir / "transcripciones").rglob("*.json") if p.name != "_progreso.csv"
-    ]
-    speakers_matches = list((out_dir / "diarizaciones").rglob("*.speakers.json"))
-    if not transcript_matches or not speakers_matches:
-        raise RuntimeError("El pipeline local no generó los archivos esperados (revisa los logs arriba).")
-    transcript_data = json.loads(transcript_matches[0].read_text(encoding="utf-8"))
-    speakers_data = json.loads(speakers_matches[0].read_text(encoding="utf-8"))
-    return speakers_data, transcript_data
+def _first_json(folder: Path, pattern: str) -> dict[str, Any] | None:
+    matches = [p for p in folder.rglob(pattern) if p.name != "_progreso.csv"]
+    if not matches:
+        return None
+    return json.loads(matches[0].read_text(encoding="utf-8"))
 
 
-def build_payload(speakers_data: dict[str, Any], transcript_data: dict[str, Any], cfg: Config) -> dict[str, Any]:
-    turns = speakers_data.get("turns") or []
-    units = speakers_data.get("units") or []
+def load_results(
+    out_dir: Path, *, want_transcription: bool, want_diarization: bool
+) -> dict[str, Any]:
+    """Lee los archivos que dejó el pipeline local. Solo exige los que
+    corresponden a los `requested_outputs` del job."""
+    transcript_data = _first_json(out_dir / "transcripciones", "*.json") if want_transcription else None
+    diarization_data = _first_json(out_dir / "diarizaciones", "*.diarization.json") if want_diarization else None
+    # El .speakers.json (transcripción alineada con hablante) solo existe cuando
+    # se pidieron ambas salidas.
+    speakers_data = (
+        _first_json(out_dir / "diarizaciones", "*.speakers.json")
+        if want_transcription and want_diarization
+        else None
+    )
 
-    text = "\n".join(f"[{turn['speaker']}] {turn['text']}" for turn in turns).strip()
-    words = []
-    for unit in units:
-        word: dict[str, Any] = {
-            "text": str(unit.get("text", "")).strip(),
-            "start": unit.get("start"),
-            "end": unit.get("end"),
-            "type": "word",
-            "speaker_id": unit.get("speaker"),
-        }
-        probability = unit.get("probability")
-        if probability is not None and probability > 0:
-            word["logprob"] = math.log(probability)
-        words.append(word)
+    missing = []
+    if want_transcription and transcript_data is None:
+        missing.append("transcripciones/*.json")
+    if want_diarization and diarization_data is None:
+        missing.append("diarizaciones/*.diarization.json")
+    if want_transcription and want_diarization and speakers_data is None:
+        missing.append("diarizaciones/*.speakers.json")
+    if missing:
+        raise RuntimeError(
+            "El pipeline local no generó: " + ", ".join(missing) + " (revisa los logs arriba)."
+        )
 
+    return {
+        "transcript_data": transcript_data,
+        "diarization_data": diarization_data,
+        "speakers_data": speakers_data,
+    }
+
+
+def _word_from_unit(unit: dict[str, Any], *, with_speaker: bool) -> dict[str, Any]:
+    word: dict[str, Any] = {
+        "text": str(unit.get("text") or unit.get("word") or "").strip(),
+        "start": unit.get("start"),
+        "end": unit.get("end"),
+        "type": "word",
+    }
+    if with_speaker:
+        word["speaker_id"] = unit.get("speaker")
+    probability = unit.get("probability")
+    if probability is not None and probability > 0:
+        word["logprob"] = math.log(probability)
+    return word
+
+
+def whisper_model_label(whisper_model: str) -> str:
+    name = whisper_model.split("/")[-1]
+    return name if name.lower().startswith("whisper") else f"whisper-{name}"
+
+
+def pyannote_model_label(pyannote_model: str) -> str:
+    name = pyannote_model.split("/")[-1]
+    return name if name.lower().startswith("pyannote") else f"pyannote-{name}"
+
+
+def build_transcription_output(
+    cfg: Config,
+    transcript_data: dict[str, Any],
+    speakers_data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if speakers_data is not None:
+        # Con diarización: texto por turno con etiqueta y palabras con speaker_id.
+        turns = speakers_data.get("turns") or []
+        units = speakers_data.get("units") or []
+        text = "\n".join(f"[{turn['speaker']}] {turn['text']}" for turn in turns).strip()
+        words = [_word_from_unit(u, with_speaker=True) for u in units]
+    else:
+        # Solo transcripción: un segmento de Whisper por línea, sin hablante.
+        segments = transcript_data.get("segments") or []
+        text = "\n".join(
+            " ".join(str(seg.get("text", "")).split()) for seg in segments
+        ).strip()
+        words = [
+            _word_from_unit(w, with_speaker=False)
+            for seg in segments
+            for w in (seg.get("words") or [])
+            if w.get("start") is not None and w.get("end") is not None
+        ]
     return {
         "text": text,
         "language": transcript_data.get("language") or cfg.language,
-        "model": (
-            f"{cfg.transcription_engine}-{cfg.whisper_model.split('/')[-1]}"
-            f"+{cfg.diarization_engine}-{cfg.pyannote_model.split('/')[-1]}"
-        ),
+        "model": whisper_model_label(cfg.whisper_model),
         "words": words,
     }
+
+
+def build_diarization_output(
+    cfg: Config,
+    diarization_data: dict[str, Any],
+    speakers_data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    processing_seconds = diarization_data.get("processing_seconds")
+    metadata: dict[str, Any] = {}
+    if speakers_data is not None:
+        # Con transcripción: los "segmentos" son los turnos alineados (con texto).
+        turns = speakers_data.get("turns") or []
+        segments = [
+            {
+                "speaker_id": turn["speaker"],
+                "start": turn["start"],
+                "end": turn["end"],
+                "text": turn["text"],
+            }
+            for turn in turns
+        ]
+        speaker_count = len(diarization_data.get("speakers") or speakers_data.get("speakers") or [])
+    else:
+        # Solo diarización: intervalos exclusivos (un hablante por instante), sin texto.
+        segments = [
+            {"speaker_id": item["speaker"], "start": item["start"], "end": item["end"]}
+            for item in (diarization_data.get("exclusive_diarization") or [])
+        ]
+        speaker_count = diarization_data.get("num_speakers")
+        if speaker_count is None:
+            speaker_count = len(diarization_data.get("speakers") or [])
+
+    metadata["speaker_count"] = speaker_count
+    if processing_seconds is not None:
+        metadata["processing_time_ms"] = round(float(processing_seconds) * 1000)
+
+    return {
+        "model": pyannote_model_label(diarization_data.get("model") or cfg.pyannote_model),
+        "segments": segments,
+        "metadata": metadata,
+    }
+
+
+def build_payload(
+    cfg: Config,
+    *,
+    want_transcription: bool,
+    want_diarization: bool,
+    transcript_data: dict[str, Any] | None,
+    diarization_data: dict[str, Any] | None,
+    speakers_data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    outputs: dict[str, Any] = {}
+    if want_transcription:
+        outputs["transcription"] = build_transcription_output(cfg, transcript_data or {}, speakers_data)
+    if want_diarization:
+        outputs["diarization"] = build_diarization_output(cfg, diarization_data or {}, speakers_data)
+    return {"outputs": outputs}
 
 
 @dataclass
@@ -419,10 +595,39 @@ class PreparedJob:
     job: dict[str, Any]
     job_id: str
     lease_id: str
+    requested_outputs: list[str]
     session: requests.Session
     tmp_dir: tempfile.TemporaryDirectory
     audio_path: Path
     heartbeat: HeartbeatThread
+
+
+def resolve_requested_outputs(job: dict[str, Any], cfg: Config) -> list[str]:
+    """Determina qué salidas pide el job. Usa `requested_outputs` si viene; si no,
+    lo deriva de `options` (`transcribe`/`diarize`). Devuelve la lista en el orden
+    canónico y falla si pide algo fuera de las capacidades del worker."""
+    raw = job.get("requested_outputs")
+    if raw:
+        wanted = {str(item).strip().lower() for item in raw}
+    else:
+        options = job.get("options") or {}
+        wanted = set()
+        if options.get("transcribe"):
+            wanted.add(TRANSCRIPTION)
+        if options.get("diarize"):
+            wanted.add(DIARIZATION)
+    unknown = wanted - set(ALL_CAPABILITIES)
+    if unknown:
+        raise ValueError(f"requested_outputs desconocido(s): {', '.join(sorted(unknown))}")
+    if not wanted:
+        raise ValueError("el job no pide ninguna salida (requested_outputs vacío)")
+    outside = wanted - set(cfg.capabilities)
+    if outside:
+        raise ValueError(
+            f"el job pide {', '.join(sorted(outside))} pero este worker solo anuncia "
+            f"{', '.join(cfg.capabilities)}"
+        )
+    return [item for item in ALL_CAPABILITIES if item in wanted]
 
 
 def prepare_job(cfg: Config, live: bool) -> PreparedJob | None:
@@ -453,6 +658,18 @@ def prepare_job(cfg: Config, live: bool) -> PreparedJob | None:
         )
         return None
 
+    try:
+        requested_outputs = resolve_requested_outputs(job, cfg)
+    except ValueError as exc:
+        print(f"  [{job_id}] job rechazado: {exc}", file=sys.stderr)
+        if live:
+            try:
+                fail_job(session, cfg, job_id, lease_id, str(exc), retryable=False)
+            except Exception as fail_exc:
+                print(f"  [{job_id}] no se pudo reportar el rechazo: {fail_exc}", file=sys.stderr)
+        return None
+    print(f"  [{job_id}] salidas pedidas: {', '.join(requested_outputs)}")
+
     heartbeat = HeartbeatThread(session, cfg, job_id, lease_id, cfg.heartbeat_interval)
     heartbeat.start()
 
@@ -482,6 +699,7 @@ def prepare_job(cfg: Config, live: bool) -> PreparedJob | None:
         job=job,
         job_id=job_id,
         lease_id=lease_id,
+        requested_outputs=requested_outputs,
         session=session,
         tmp_dir=tmp_dir,
         audio_path=audio_path,
@@ -489,28 +707,74 @@ def prepare_job(cfg: Config, live: bool) -> PreparedJob | None:
     )
 
 
-def process_prepared_job(cfg: Config, prepared: PreparedJob, live: bool, engine: Any | None = None) -> None:
+def _finish_job(cfg: Config, prepared: PreparedJob, payload: dict[str, Any]) -> None:
+    """Sube el resultado de un job a /complete y libera sus recursos (heartbeat,
+    carpeta temporal, sesión HTTP). Lo llama el hilo `advance` del loop, no el
+    hilo principal: el POST puede tardar (payload con miles de `words`)."""
+    job_id, lease_id, session = prepared.job_id, prepared.lease_id, prepared.session
+    try:
+        complete_job(session, cfg, job_id, lease_id, payload)
+        print(f"  [{job_id}] subido correctamente (complete).", flush=True)
+    except Exception as exc:
+        print(f"  [{job_id}] ERROR al subir el resultado: {exc}", file=sys.stderr)
+        traceback.print_exc()
+        try:
+            fail_job(session, cfg, job_id, lease_id, str(exc), retryable=True)
+            print(f"  [{job_id}] reportado como fallido (fail, retryable=true).", file=sys.stderr)
+        except Exception as fail_exc:
+            print(f"  [{job_id}] no se pudo reportar el fallo a la API: {fail_exc}", file=sys.stderr)
+    finally:
+        prepared.heartbeat.stop()
+        prepared.tmp_dir.cleanup()
+        prepared.session.close()
+
+
+def process_prepared_job(
+    cfg: Config, prepared: PreparedJob, live: bool, engine: Any | None = None
+) -> dict[str, Any] | None:
+    """Corre las etapas del job (parte que usa GPU/CPU, bloqueante) y devuelve el
+    payload listo para subir. En dry-run limpia los recursos del job y devuelve
+    None. La subida (y la limpieza, en modo live) las hace el llamador vía
+    _finish_job. Si el cómputo falla, reporta /fail, limpia y relanza."""
     job_id = prepared.job_id
     lease_id = prepared.lease_id
     session = prepared.session
 
-    print(f"\n=== Job {job_id} (lease {lease_id}) ===")
+    want_transcription = TRANSCRIPTION in prepared.requested_outputs
+    want_diarization = DIARIZATION in prepared.requested_outputs
+
+    print(f"\n=== Job {job_id} (lease {lease_id}) — {', '.join(prepared.requested_outputs)} ===")
     try:
         tmp_path = Path(prepared.tmp_dir.name)
         print(f"  audio ya descargado: {prepared.audio_path.name}")
 
-        print("  transcribiendo + diarizando localmente (puede tardar varios minutos en CPU)...")
+        etapas = " + ".join(prepared.requested_outputs)
+        print(f"  procesando localmente ({etapas}) (puede tardar varios minutos en CPU)...")
         out_dir = tmp_path / "out"
         attempt = 1
         while True:
             try:
                 if engine is not None:
-                    speakers_data, transcript_data = engine.process(
-                        prepared.audio_path, out_dir, language=cfg.language
+                    results = engine.process(
+                        prepared.audio_path,
+                        out_dir,
+                        language=cfg.language,
+                        want_transcription=want_transcription,
+                        want_diarization=want_diarization,
                     )
                 else:
-                    run_local_pipeline(cfg, prepared.audio_path, out_dir)
-                    speakers_data, transcript_data = load_results(out_dir)
+                    run_local_pipeline(
+                        cfg,
+                        prepared.audio_path,
+                        out_dir,
+                        want_transcription=want_transcription,
+                        want_diarization=want_diarization,
+                    )
+                    results = load_results(
+                        out_dir,
+                        want_transcription=want_transcription,
+                        want_diarization=want_diarization,
+                    )
                 break
             except Exception as exc:
                 if is_local_file_lock_error(exc):
@@ -531,7 +795,12 @@ def process_prepared_job(cfg: Config, prepared: PreparedJob, live: bool, engine:
                         attempt += 1
                         continue
                 raise
-        payload = build_payload(speakers_data, transcript_data, cfg)
+        payload = build_payload(
+            cfg,
+            want_transcription=want_transcription,
+            want_diarization=want_diarization,
+            **results,
+        )
 
         cfg.results_dir.mkdir(parents=True, exist_ok=True)
         result_path = cfg.results_dir / f"{job_id}.json"
@@ -541,10 +810,12 @@ def process_prepared_job(cfg: Config, prepared: PreparedJob, live: bool, engine:
         if not live:
             print("  modo DRY-RUN: no se sube nada a la API todavía.")
             print("  revisa el archivo de arriba y vuelve a correr con --live para subir resultados reales.")
-            return
+            prepared.heartbeat.stop()
+            prepared.tmp_dir.cleanup()
+            prepared.session.close()
+            return None
 
-        complete_job(session, cfg, job_id, lease_id, payload)
-        print("  subido correctamente (complete).")
+        return payload
     except Exception as exc:
         print(f"  ERROR: {exc}", file=sys.stderr)
         traceback.print_exc()
@@ -554,11 +825,10 @@ def process_prepared_job(cfg: Config, prepared: PreparedJob, live: bool, engine:
                 print("  reportado como fallido (fail, retryable=true).")
             except Exception as fail_exc:
                 print(f"  no se pudo reportar el fallo a la API: {fail_exc}", file=sys.stderr)
-        raise
-    finally:
         prepared.heartbeat.stop()
         prepared.tmp_dir.cleanup()
         prepared.session.close()
+        raise
 
 
 def main() -> int:
@@ -576,6 +846,24 @@ def main() -> int:
         help="Procesa un solo job (o detecta que no hay ninguno pendiente) y termina.",
     )
     parser.add_argument("--poll-interval", type=float, help="Segundos entre intentos de lease cuando no hay trabajo.")
+    capability_group = parser.add_mutually_exclusive_group()
+    capability_group.add_argument(
+        "--transcription-only",
+        action="store_true",
+        help="Solo toma jobs de transcripción (anuncia capabilities=[transcription]).",
+    )
+    capability_group.add_argument(
+        "--diarization-only",
+        action="store_true",
+        help="Solo toma jobs de diarización (anuncia capabilities=[diarization]).",
+    )
+    capability_group.add_argument(
+        "--capabilities",
+        help=(
+            "Lista separada por comas de las salidas que este worker acepta "
+            "(transcription, diarization). Default: ambas, o WORKER_CAPABILITIES del .env."
+        ),
+    )
     parser.add_argument(
         "--persistent-models",
         action="store_true",
@@ -587,7 +875,16 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    cfg = load_config(args.poll_interval)
+    capabilities_override: list[str] | None = None
+    if args.transcription_only:
+        capabilities_override = [TRANSCRIPTION]
+    elif args.diarization_only:
+        capabilities_override = [DIARIZATION]
+    elif args.capabilities:
+        capabilities_override = parse_capabilities(args.capabilities)
+
+    cfg = load_config(args.poll_interval, capabilities_override)
+    print(f"Capacidades del worker: {', '.join(cfg.capabilities)}")
 
     engine = None
     if args.persistent_models:
@@ -602,7 +899,15 @@ def main() -> int:
             "int8_float16" if cfg.device == "cuda" else "int8"
         )
         batch_size = cfg.whisper_batch_size if cfg.device == "cuda" else 0
-        print("Cargando modelos en memoria (whisper + pyannote)...")
+        # Solo carga el modelo de las capacidades anunciadas: un worker
+        # --transcription-only no paga la VRAM ni el arranque de Pyannote, y
+        # viceversa.
+        load_whisper = TRANSCRIPTION in cfg.capabilities
+        load_pyannote = DIARIZATION in cfg.capabilities
+        cuales = " + ".join(
+            name for name, on in (("whisper", load_whisper), ("pyannote", load_pyannote)) if on
+        )
+        print(f"Cargando modelos en memoria ({cuales})...")
         engine = PersistentEngine(
             whisper_model=cfg.whisper_model,
             device=cfg.device,
@@ -613,6 +918,8 @@ def main() -> int:
             pyannote_model=cfg.pyannote_model,
             segmentation_batch_size=cfg.segmentation_batch_size,
             embedding_batch_size=cfg.embedding_batch_size,
+            load_whisper=load_whisper,
+            load_pyannote=load_pyannote,
         )
 
     stop_requested = threading.Event()
@@ -622,15 +929,55 @@ def main() -> int:
         key_watcher.start()
         print(f"(Presiona '{STOP_KEY.decode()}' para detener el worker tras el job actual.)")
 
+    # Un único hilo de fondo, `advance`, hace TODO lo que va entre jobs y no usa
+    # GPU, en este orden: (1) sube a /complete el resultado del job recién
+    # terminado y libera sus recursos, (2) pide el siguiente lease, (3)
+    # pre-descarga su MP3. Así, mientras el hilo principal procesa el job N+1 en
+    # la GPU, `advance` cierra el N y trae el N+2. Solo 2 hilos, y el lease del
+    # N+2 nunca ocurre antes de que la subida del N haya terminado (van seguidos
+    # en el mismo hilo, y el principal hace join antes de avanzar). Por eso el
+    # worker sostiene como mucho 2 leases a la vez: el que procesa + el que
+    # `advance` esté tocando en ese instante (subiendo O leaseando, nunca ambos).
+    advance_box: list[PreparedJob | None] = [None]
+
+    def start_advance(pending_upload: tuple[PreparedJob, dict[str, Any]] | None) -> threading.Thread | None:
+        """Lanza el hilo de fondo. `pending_upload` es (prepared, payload) del job
+        recién procesado, o None cuando no hay job previo que subir (arranque, o
+        tras un rato sin trabajo)."""
+        fetch = not args.once and not stop_requested.is_set()
+        if pending_upload is None and not fetch:
+            return None
+        advance_box[0] = None
+
+        def _run() -> None:
+            if pending_upload is not None:
+                _finish_job(cfg, pending_upload[0], pending_upload[1])
+            if fetch:
+                try:
+                    advance_box[0] = prepare_job(cfg, args.live)
+                except Exception as exc:  # que un fallo raro del prefetch no mate el hilo en silencio
+                    print(f"  prefetch del siguiente job falló: {exc}", file=sys.stderr)
+                    traceback.print_exc()
+
+        thread = threading.Thread(target=_run, name="advance", daemon=True)
+        thread.start()
+        return thread
+
     print(f"Worker '{cfg.worker_id}' -> {cfg.base_url}  (modo: {'LIVE' if args.live else 'DRY-RUN'})")
+    advance: threading.Thread | None = None
     try:
         current: PreparedJob | None = None
         while True:
             if current is None:
-                if stop_requested.is_set():
-                    print("Detención solicitada: no se tomarán más trabajos. Saliendo.")
-                    return 0
-                current = prepare_job(cfg, args.live)
+                if advance is not None:
+                    advance.join()  # deja terminar la subida del último job
+                    current = advance_box[0]
+                    advance = None
+                if current is None:
+                    if stop_requested.is_set():
+                        print("Detención solicitada: no quedan trabajos en curso. Saliendo.")
+                        return 0
+                    current = prepare_job(cfg, args.live)
                 if current is None:
                     print("Sin trabajos pendientes.")
                     if args.once:
@@ -638,34 +985,40 @@ def main() -> int:
                     time.sleep(cfg.poll_interval)
                     continue
 
-            # Mientras se procesa `current` (CPU/GPU), pre-descargamos el
-            # siguiente job en un hilo aparte para que ya esté listo al
-            # terminar (evita el hueco muerto de descarga entre jobs).
-            prefetch_thread: threading.Thread | None = None
-            prefetch_box: list[PreparedJob | None] = [None]
-            if not args.once and not stop_requested.is_set():
-                def _prefetch() -> None:
-                    prefetch_box[0] = prepare_job(cfg, args.live)
-
-                prefetch_thread = threading.Thread(target=_prefetch, daemon=True)
-                prefetch_thread.start()
+            # Asegura que `advance` esté trayendo el sucesor de `current` mientras
+            # lo procesamos. En la primera vuelta no hay nada que subir todavía.
+            if advance is None:
+                advance = start_advance(pending_upload=None)
 
             try:
-                process_prepared_job(cfg, current, live=args.live, engine=engine)
+                payload = process_prepared_job(cfg, current, live=args.live, engine=engine)
             except Exception:
-                pass  # ya fue reportado/loggeado dentro de process_prepared_job
+                payload = None  # ya reportado y limpiado dentro de process_prepared_job
+
+            following: PreparedJob | None = None
+            if advance is not None:
+                advance.join()
+                following = advance_box[0]
+                advance = None
+
+            if payload is not None and args.live:
+                if args.once:
+                    _finish_job(cfg, current, payload)
+                else:
+                    advance = start_advance(pending_upload=(current, payload))
 
             if args.once:
+                if advance is not None:
+                    advance.join()
                 return 0
 
-            if prefetch_thread is not None:
-                prefetch_thread.join()
-                current = prefetch_box[0]
-            else:
-                current = None
+            current = following
     finally:
         if key_watcher:
             key_watcher.stop()
+        # Ctrl+C / excepción: da un margen acotado a la subida en vuelo, sin colgar.
+        if advance is not None:
+            advance.join(timeout=60)
 
 
 if __name__ == "__main__":
