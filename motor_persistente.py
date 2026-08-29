@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 PACKAGE_ROOT = Path(__file__).resolve().parent
 SCRIPTS_ROOT = PACKAGE_ROOT / "scripts_originales"
 if str(SCRIPTS_ROOT) not in sys.path:
@@ -88,9 +90,19 @@ class PersistentEngine:
         self.can_prewarm = (
             isinstance(self.transcriber, BatchedInferencePipeline) and fwb.is_supported()
         )
+        if self.can_prewarm:
+            # Fuerza la carga del modelo de Silero ahora (es lru_cached), para que
+            # el primer job no pague ~3-5 s de carga dentro de su VAD.
+            try:
+                from faster_whisper.vad import get_speech_timestamps
+
+                get_speech_timestamps(np.zeros(1600, dtype=np.float32))
+                print("  [motor persistente] VAD de Silero listo.", flush=True)
+            except Exception:
+                pass
         print("  [motor persistente] modelos listos.", flush=True)
 
-    def prewarm(self, audio_path: Path):
+    def prewarm(self, audio_path: Path, label: str | None = None):
         """Fase CPU de la transcripción (decode + VAD + collect_chunks + log-mel),
         para correrla por adelantado fuera del camino crítico de la GPU. Devuelve
         el dict que `process` pasará a transcribir.transcribe_one, o None si no
@@ -98,19 +110,20 @@ class PersistentEngine:
         if not self.can_prewarm:
             return None
         try:
-            started = datetime.now()
             prepared = fwb.prepare(
                 self.transcriber, str(audio_path),
                 vad_parameters={"min_silence_duration_ms": 700},
             )
-            elapsed = (datetime.now() - started).total_seconds()
+            t = prepared["timings"]
             print(
-                f"  [motor persistente] pre-calentado {audio_path.name}: "
-                f"{len(prepared['features'])} chunks, {elapsed:.1f}s"
+                f"  [motor persistente] pre-calentado [{label or audio_path.name}]: "
+                f"{len(prepared['features'])} chunks de {prepared['duration'] / 60:.1f} min "
+                f"en {t['total']:.1f}s (decode {t['decode']:.1f} + vad {t['vad']:.1f} "
+                f"+ mel {t['mel']:.1f})"
             )
             return prepared
         except Exception as exc:  # nunca romper el prefetch por esto
-            print(f"  [motor persistente] pre-calentado falló ({exc}); se hará en línea", flush=True)
+            print(f"  [motor persistente] pre-calentado [{label}] falló ({exc}); se hará en línea", flush=True)
             return None
 
     def process(

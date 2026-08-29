@@ -306,23 +306,24 @@ job para otro worker). Al terminar se sube a
 `POST /api/internal/jobs/audio-processing/:job_id/complete`.
 
 Para no dejar la GPU ociosa entre jobs, mientras el hilo principal procesa un
-job un único hilo de fondo (`advance`) hace, en orden, todo lo que no usa GPU:
-(1) sube a `/complete` el resultado del job anterior y libera sus recursos, (2)
-pide el siguiente lease, (3) pre-descarga su MP3 y (4, solo con
-`--persistent-models`) corre la **fase CPU de la transcripción** de ese job
-—decode a 16 kHz, VAD de Silero, troceo a ≤30 s y log-mel— para que la GPU
-arranque directo en inferencia sin perder ~3-10 s con la GPU parada. Esa fase es
-una copia fiel del cuerpo de `BatchedInferencePipeline.transcribe`
-(`scripts_originales/faster_whisper_batched.py`, acoplada a faster-whisper
-1.2.1), partida en el límite CPU/GPU: la salida es **idéntica** al camino normal.
-Si la versión no coincide o algo falla, se hace en línea como siempre. Así el
-POST (que puede ser de
-varios MB) se solapa con el cómputo del job siguiente, y el lease de un job nuevo
-**no se pide hasta que la subida del anterior haya terminado** (van seguidos en
-el mismo hilo). Son solo 2 hilos y el worker sostiene como mucho **2 leases** a
-la vez: el que procesa + el que `advance` esté tocando en ese instante (subiendo
-o leaseando, nunca ambos). Al detenerlo (`q`, o sin trabajos con `--once`) espera
-a que termine la subida en curso.
+job el hilo de fondo `advance` hace todo lo que no usa GPU: **dispara** la subida
+a `/complete` del job anterior (en su propio hilo, sin esperarla) y sin bloquearse
+pide el siguiente lease, pre-descarga su MP3 y (solo con `--persistent-models`)
+corre la **fase CPU de su transcripción** —decode a 16 kHz, VAD de Silero, troceo
+a ≤30 s y log-mel— para que la GPU arranque directo en inferencia sin perder
+~3-10 s parada. Esa fase es una copia fiel del cuerpo de
+`BatchedInferencePipeline.transcribe`
+(`scripts_originales/faster_whisper_batched.py`, acoplada a faster-whisper 1.2.1),
+partida en el límite CPU/GPU: la salida es **idéntica** al camino normal; si la
+versión no coincide o algo falla, se hace en línea como siempre.
+
+Como la subida no bloquea nada, una subida lenta no frena el arranque del job
+siguiente. El worker puede sostener **3 leases** un rato (job N subiendo,
+N+1 procesando, N+2 listo); es seguro porque el heartbeat de N (cada 30 s)
+mantiene su lease vivo hasta que la subida termina, y una subida —jobs cortos—
+tarda muchísimo menos que el TTL de 60 s. Si aun así fallara, se reporta `/fail`
+y el job se re-encola. Se toleran hasta 3 subidas en vuelo (backpressure) y al
+detenerlo (`q`, o sin trabajos con `--once`) se esperan las pendientes.
 
 Forma del payload:
 

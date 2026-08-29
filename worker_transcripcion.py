@@ -944,21 +944,44 @@ def main() -> int:
     def lease_and_prewarm() -> PreparedJob | None:
         job = prepare_job(cfg, args.live)
         if job is not None and prewarm and TRANSCRIPTION in job.requested_outputs:
-            job.prepared_audio = engine.prewarm(job.audio_path)
+            job.prepared_audio = engine.prewarm(job.audio_path, label=job.job_id)
         return job
 
-    # Un único hilo de fondo, `advance`, hace TODO lo que va entre jobs y no usa
-    # GPU, en este orden: (1) sube a /complete el resultado del job recién
-    # terminado y libera sus recursos, (2) pide el siguiente lease, (3)
-    # pre-descarga su MP3 y (4, con --persistent-models) corre la fase CPU de la
-    # transcripción (decode + VAD + log-mel). Así, mientras el hilo principal
-    # procesa el job N+1 en la GPU, `advance` cierra el N y deja el N+2 listo
-    # para entrar directo a inferencia. Solo 2 hilos, y el lease del N+2 nunca
-    # ocurre antes de que la subida del N haya terminado (van seguidos en el
-    # mismo hilo, y el principal hace join antes de avanzar). Por eso el worker
-    # sostiene como mucho 2 leases a la vez: el que procesa + el que `advance`
-    # esté tocando en ese instante (subiendo O leaseando, nunca ambos).
+    # El hilo de fondo `advance` hace lo que va entre jobs y no usa GPU: dispara
+    # la subida a /complete del job recién terminado (fire-and-forget, en su
+    # propio hilo) y sin esperarla pide el siguiente lease, pre-descarga su MP3 y
+    # (con --persistent-models) corre la fase CPU de su transcripción. Así,
+    # mientras el hilo principal procesa el job N+1 en la GPU, `advance` deja el
+    # N+2 listo para entrar directo a inferencia, y una subida lenta de N nunca
+    # frena eso.
+    #
+    # La subida de N puede quedar en vuelo cuando ya se leaseó N+2 => el worker
+    # puede sostener 3 leases un rato (N subiendo, N+1 procesando, N+2 listo). Es
+    # seguro: el heartbeat de N (cada 30 s) mantiene su lease vivo hasta que
+    # _finish_job lo detiene, y la subida —jobs cortos— tarda muchísimo menos que
+    # el TTL de 60 s. Si aun así fallara, se reporta /fail y el job se re-encola.
     advance_box: list[PreparedJob | None] = [None]
+    uploads_in_flight: list[threading.Thread] = []
+    MAX_UPLOADS_IN_FLIGHT = 3
+
+    def drain_uploads(timeout: float | None = None) -> None:
+        for t in list(uploads_in_flight):
+            t.join(timeout)
+        uploads_in_flight[:] = [t for t in uploads_in_flight if t.is_alive()]
+
+    def start_upload(prepared: PreparedJob, payload: dict[str, Any]) -> None:
+        # Si la API está lenta y se acumulan subidas, espera a la más vieja antes
+        # de encarar otra (backpressure), para no acaparar leases sin límite.
+        uploads_in_flight[:] = [t for t in uploads_in_flight if t.is_alive()]
+        if len(uploads_in_flight) >= MAX_UPLOADS_IN_FLIGHT:
+            uploads_in_flight[0].join()
+            uploads_in_flight[:] = [t for t in uploads_in_flight if t.is_alive()]
+        t = threading.Thread(
+            target=_finish_job, args=(cfg, prepared, payload),
+            name=f"upload-{prepared.job_id}", daemon=True,
+        )
+        t.start()
+        uploads_in_flight.append(t)
 
     def start_advance(pending_upload: tuple[PreparedJob, dict[str, Any]] | None) -> threading.Thread | None:
         """Lanza el hilo de fondo. `pending_upload` es (prepared, payload) del job
@@ -971,7 +994,7 @@ def main() -> int:
 
         def _run() -> None:
             if pending_upload is not None:
-                _finish_job(cfg, pending_upload[0], pending_upload[1])
+                start_upload(pending_upload[0], pending_upload[1])  # fire-and-forget
             if fetch:
                 try:
                     advance_box[0] = lease_and_prewarm()
@@ -995,13 +1018,16 @@ def main() -> int:
                     advance = None
                 if current is None:
                     if stop_requested.is_set():
-                        print("Detención solicitada: no quedan trabajos en curso. Saliendo.")
+                        print("Detención solicitada: esperando subidas en curso...")
+                        drain_uploads()
                         return 0
                     current = lease_and_prewarm()
                 if current is None:
                     print("Sin trabajos pendientes.")
                     if args.once:
+                        drain_uploads()
                         return 0
+                    drain_uploads(timeout=0.0)  # recoge las que ya terminaron
                     time.sleep(cfg.poll_interval)
                     continue
 
@@ -1023,7 +1049,7 @@ def main() -> int:
 
             if payload is not None and args.live:
                 if args.once:
-                    _finish_job(cfg, current, payload)
+                    _finish_job(cfg, current, payload)  # último job: espera la subida
                 else:
                     advance = start_advance(pending_upload=(current, payload))
 
@@ -1032,13 +1058,15 @@ def main() -> int:
                     advance.join()
                 return 0
 
+            uploads_in_flight[:] = [t for t in uploads_in_flight if t.is_alive()]
             current = following
     finally:
         if key_watcher:
             key_watcher.stop()
-        # Ctrl+C / excepción: da un margen acotado a la subida en vuelo, sin colgar.
+        # Ctrl+C / excepción: da un margen acotado a lo que quede en vuelo, sin colgar.
         if advance is not None:
             advance.join(timeout=60)
+        drain_uploads(timeout=60)
 
 
 if __name__ == "__main__":

@@ -53,8 +53,12 @@ def prepare(
     model = pipeline.model
     sampling_rate = model.feature_extractor.sampling_rate
 
+    import time as _time
+
+    t0 = _time.perf_counter()
     if not isinstance(audio, np.ndarray):
         audio = decode_audio(audio, sampling_rate=sampling_rate)
+    t_decode = _time.perf_counter()
     duration = audio.shape[0] / sampling_rate
 
     chunk_length = model.feature_extractor.chunk_length
@@ -72,6 +76,7 @@ def prepare(
     audio_chunks, chunks_metadata = collect_chunks(
         audio, clip_timestamps, max_duration=chunk_length
     )
+    t_vad = _time.perf_counter()
 
     duration_after_vad = (
         sum((seg["end"] - seg["start"]) for seg in clip_timestamps) / sampling_rate
@@ -82,6 +87,7 @@ def prepare(
         if duration_after_vad
         else []
     )
+    t_mel = _time.perf_counter()
 
     return {
         "features": features,
@@ -90,6 +96,12 @@ def prepare(
         "duration": duration,
         "duration_after_vad": duration_after_vad,
         "sampling_rate": sampling_rate,
+        "timings": {
+            "decode": t_decode - t0,
+            "vad": t_vad - t_decode,
+            "mel": t_mel - t_vad,
+            "total": t_mel - t0,
+        },
     }
 
 
