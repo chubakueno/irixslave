@@ -600,6 +600,10 @@ class PreparedJob:
     tmp_dir: tempfile.TemporaryDirectory
     audio_path: Path
     heartbeat: HeartbeatThread
+    # Rellenado por engine.prewarm() en el hilo `advance`: la fase CPU de la
+    # transcripción (decode + VAD + collect_chunks + log-mel) ya hecha, para que
+    # la GPU arranque directo en inferencia. None si no se pre-calentó.
+    prepared_audio: Any = None
 
 
 def resolve_requested_outputs(job: dict[str, Any], cfg: Config) -> list[str]:
@@ -761,6 +765,7 @@ def process_prepared_job(
                         language=cfg.language,
                         want_transcription=want_transcription,
                         want_diarization=want_diarization,
+                        prepared_audio=prepared.prepared_audio,
                     )
                 else:
                     run_local_pipeline(
@@ -929,15 +934,30 @@ def main() -> int:
         key_watcher.start()
         print(f"(Presiona '{STOP_KEY.decode()}' para detener el worker tras el job actual.)")
 
+    # Con modelos persistentes y capacidad de transcripción, el hilo `advance`
+    # corre la fase CPU de la transcripción del siguiente job por adelantado
+    # (decode + VAD + log-mel), aprovechando su tiempo ocioso mientras la GPU
+    # procesa el actual. El camino por subproceso no puede recibir el resultado
+    # en memoria, así que ahí no se pre-calienta.
+    prewarm = args.persistent_models and TRANSCRIPTION in cfg.capabilities
+
+    def lease_and_prewarm() -> PreparedJob | None:
+        job = prepare_job(cfg, args.live)
+        if job is not None and prewarm and TRANSCRIPTION in job.requested_outputs:
+            job.prepared_audio = engine.prewarm(job.audio_path)
+        return job
+
     # Un único hilo de fondo, `advance`, hace TODO lo que va entre jobs y no usa
     # GPU, en este orden: (1) sube a /complete el resultado del job recién
     # terminado y libera sus recursos, (2) pide el siguiente lease, (3)
-    # pre-descarga su MP3. Así, mientras el hilo principal procesa el job N+1 en
-    # la GPU, `advance` cierra el N y trae el N+2. Solo 2 hilos, y el lease del
-    # N+2 nunca ocurre antes de que la subida del N haya terminado (van seguidos
-    # en el mismo hilo, y el principal hace join antes de avanzar). Por eso el
-    # worker sostiene como mucho 2 leases a la vez: el que procesa + el que
-    # `advance` esté tocando en ese instante (subiendo O leaseando, nunca ambos).
+    # pre-descarga su MP3 y (4, con --persistent-models) corre la fase CPU de la
+    # transcripción (decode + VAD + log-mel). Así, mientras el hilo principal
+    # procesa el job N+1 en la GPU, `advance` cierra el N y deja el N+2 listo
+    # para entrar directo a inferencia. Solo 2 hilos, y el lease del N+2 nunca
+    # ocurre antes de que la subida del N haya terminado (van seguidos en el
+    # mismo hilo, y el principal hace join antes de avanzar). Por eso el worker
+    # sostiene como mucho 2 leases a la vez: el que procesa + el que `advance`
+    # esté tocando en ese instante (subiendo O leaseando, nunca ambos).
     advance_box: list[PreparedJob | None] = [None]
 
     def start_advance(pending_upload: tuple[PreparedJob, dict[str, Any]] | None) -> threading.Thread | None:
@@ -954,7 +974,7 @@ def main() -> int:
                 _finish_job(cfg, pending_upload[0], pending_upload[1])
             if fetch:
                 try:
-                    advance_box[0] = prepare_job(cfg, args.live)
+                    advance_box[0] = lease_and_prewarm()
                 except Exception as exc:  # que un fallo raro del prefetch no mate el hilo en silencio
                     print(f"  prefetch del siguiente job falló: {exc}", file=sys.stderr)
                     traceback.print_exc()
@@ -977,7 +997,7 @@ def main() -> int:
                     if stop_requested.is_set():
                         print("Detención solicitada: no quedan trabajos en curso. Saliendo.")
                         return 0
-                    current = prepare_job(cfg, args.live)
+                    current = lease_and_prewarm()
                 if current is None:
                     print("Sin trabajos pendientes.")
                     if args.once:

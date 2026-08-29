@@ -115,11 +115,47 @@ def transcribe_one(
     batch_size: int,
     disable_vad: bool = False,
     word_timestamps: bool = True,
+    prepared_audio: dict | None = None,
 ) -> dict[str, str]:
     """Transcribe un solo audio con un modelo ya cargado y escribe sus salidas.
-    No atrapa excepciones: el llamador decide si continúa con el resto del lote."""
+    No atrapa excepciones: el llamador decide si continúa con el resto del lote.
+
+    `prepared_audio` es el resultado de faster_whisper_batched.prepare(): la fase
+    CPU de la transcripción (decode + VAD + collect_chunks + log-mel) ya hecha por
+    el llamador fuera del camino crítico de la GPU. Si viene, aquí solo se corre
+    la inferencia, con salida idéntica al camino normal."""
     relative = str(audio.relative_to(root))
     started = time.perf_counter()
+
+    if prepared_audio is not None:
+        import faster_whisper_batched as fwb
+
+        segments_iter, info = fwb.generate(
+            transcriber,
+            prepared_audio,
+            language=language,
+            beam_size=beam_size,
+            temperature=0,
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
+            no_speech_threshold=0.6,
+            word_timestamps=word_timestamps,
+            without_timestamps=True,
+            batch_size=batch_size,
+            vad_parameters={"min_silence_duration_ms": 700},
+        )
+        segments = list(segments_iter)
+        write_outputs(audio, root, out_root, info, segments)
+        elapsed = time.perf_counter() - started
+        return {
+            "audio": relative,
+            "status": "ok",
+            "seconds": f"{elapsed:.1f}",
+            "duration": f"{info.duration:.1f}",
+            "language": info.language,
+            "message": "",
+        }
+
     transcribe_options = {
         "language": language,
         "task": "transcribe",

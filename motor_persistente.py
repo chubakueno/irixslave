@@ -12,7 +12,9 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 import diarizar  # noqa: E402
+import faster_whisper_batched as fwb  # noqa: E402
 import transcribir  # noqa: E402
+from faster_whisper import BatchedInferencePipeline  # noqa: E402
 
 _stdlib_print = print
 
@@ -80,7 +82,36 @@ class PersistentEngine:
                 embedding_batch_size,
                 allow_cpu=allow_cpu_diarization,
             )
+        # Pre-calentado de la transcripción: solo si Whisper corre en modo lote
+        # (BatchedInferencePipeline) y la versión de faster-whisper coincide con
+        # la que vendorizamos en faster_whisper_batched.
+        self.can_prewarm = (
+            isinstance(self.transcriber, BatchedInferencePipeline) and fwb.is_supported()
+        )
         print("  [motor persistente] modelos listos.", flush=True)
+
+    def prewarm(self, audio_path: Path):
+        """Fase CPU de la transcripción (decode + VAD + collect_chunks + log-mel),
+        para correrla por adelantado fuera del camino crítico de la GPU. Devuelve
+        el dict que `process` pasará a transcribir.transcribe_one, o None si no
+        se puede pre-calentar o si algo falla (se hará en línea)."""
+        if not self.can_prewarm:
+            return None
+        try:
+            started = datetime.now()
+            prepared = fwb.prepare(
+                self.transcriber, str(audio_path),
+                vad_parameters={"min_silence_duration_ms": 700},
+            )
+            elapsed = (datetime.now() - started).total_seconds()
+            print(
+                f"  [motor persistente] pre-calentado {audio_path.name}: "
+                f"{len(prepared['features'])} chunks, {elapsed:.1f}s"
+            )
+            return prepared
+        except Exception as exc:  # nunca romper el prefetch por esto
+            print(f"  [motor persistente] pre-calentado falló ({exc}); se hará en línea", flush=True)
+            return None
 
     def process(
         self,
@@ -93,6 +124,7 @@ class PersistentEngine:
         num_speakers: int | None = None,
         min_speakers: int | None = None,
         max_speakers: int | None = None,
+        prepared_audio: dict | None = None,
     ) -> dict[str, Any]:
         """Corre las etapas pedidas y devuelve los datos ya leídos de disco, en el
         mismo formato que worker_transcripcion.load_results:
@@ -108,7 +140,8 @@ class PersistentEngine:
         relative = audio_path.relative_to(audio_root)
 
         if want_transcription:
-            print("  [motor persistente] transcribiendo...", flush=True)
+            prep = " (fase CPU pre-hecha)" if prepared_audio is not None else ""
+            print(f"  [motor persistente] transcribiendo...{prep}", flush=True)
             transcribir.transcribe_one(
                 self.transcriber,
                 audio_path,
@@ -118,6 +151,7 @@ class PersistentEngine:
                 beam_size=self.beam_size,
                 batch_size=self.batch_size,
                 word_timestamps=True,
+                prepared_audio=prepared_audio,
             )
 
         if want_diarization:
