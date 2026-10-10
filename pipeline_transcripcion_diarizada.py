@@ -256,6 +256,95 @@ def write_result_index(
     return index_path
 
 
+def completed_pair(
+    audio_root: Path,
+    audio: Path,
+    transcript_root: Path,
+    diarization_root: Path,
+) -> bool:
+    relative = audio.relative_to(audio_root)
+    transcript_json = (transcript_root / relative).with_suffix(".json")
+    diarization_json = (diarization_root / relative).with_suffix(".diarization.json")
+    speakers_json = (diarization_root / relative).with_suffix(".speakers.json")
+    return transcript_json.is_file() and diarization_json.is_file() and speakers_json.is_file()
+
+
+def run_combined_persistent(
+    *,
+    audio_root: Path,
+    audio_files: list[Path],
+    output_root: Path,
+    models_dir: Path,
+    whisper_model: str,
+    pyannote_model: str,
+    device: str,
+    compute_type: str,
+    language: str,
+    beam_size: int,
+    batch_size: int,
+    segmentation_batch_size: int,
+    embedding_batch_size: int,
+    force: bool,
+    num_speakers: int | None,
+    min_speakers: int | None,
+    max_speakers: int | None,
+) -> None:
+    from motor_persistente import PersistentEngine
+
+    transcript_root = output_root / "transcripciones"
+    diarization_root = output_root / "diarizaciones"
+    pending = [
+        audio
+        for audio in audio_files
+        if force or not completed_pair(audio_root, audio, transcript_root, diarization_root)
+    ]
+
+    print("\n=== Transcripción + diarización en proceso persistente ===", flush=True)
+    print(
+        "Reutiliza decode MP3 entre Faster-Whisper y Pyannote cuando "
+        "faster_whisper_batched está disponible.",
+        flush=True,
+    )
+    print(f"Audios encontrados: {len(audio_files)}; pendientes: {len(pending)}", flush=True)
+    if not pending:
+        return
+
+    engine = PersistentEngine(
+        whisper_model=whisper_model,
+        device=device,
+        compute_type=compute_type,
+        models_dir=models_dir,
+        batch_size=batch_size,
+        beam_size=beam_size,
+        pyannote_model=pyannote_model,
+        segmentation_batch_size=segmentation_batch_size,
+        embedding_batch_size=embedding_batch_size,
+        load_whisper=True,
+        load_pyannote=True,
+    )
+
+    for index, audio in enumerate(pending, 1):
+        relative = audio.relative_to(audio_root)
+        print(f"[{index}/{len(pending)}] {relative}", flush=True)
+        prepared_audio = engine.prewarm(
+            audio,
+            label=str(relative),
+            keep_audio_for_diarization=True,
+        )
+        engine.process(
+            audio,
+            output_root,
+            language=language,
+            want_transcription=True,
+            want_diarization=True,
+            audio_root=audio_root,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            prepared_audio=prepared_audio,
+        )
+
+
 def main() -> int:
     args = parse_args()
     package_root = Path(__file__).resolve().parent
@@ -294,6 +383,48 @@ def main() -> int:
         "int8_float16" if args.device == "cuda" else "int8"
     )
     batch_size = args.batch_size if args.device == "cuda" else 0
+
+    combined_persistent = (
+        not args.skip_transcription
+        and not args.skip_diarization
+        and args.transcription_engine == "faster-whisper"
+        and args.diarization_engine == "pyannote"
+    )
+
+    if combined_persistent:
+        os.environ.update(env)
+        run_combined_persistent(
+            audio_root=audio_root,
+            audio_files=audio_files,
+            output_root=output_root,
+            models_dir=models_dir,
+            whisper_model=args.whisper_model,
+            pyannote_model=args.pyannote_model,
+            device=args.device,
+            compute_type=compute_type,
+            language=args.language,
+            beam_size=args.beam_size,
+            batch_size=batch_size,
+            segmentation_batch_size=args.segmentation_batch_size,
+            embedding_batch_size=args.embedding_batch_size,
+            force=args.force,
+            num_speakers=args.num_speakers,
+            min_speakers=args.min_speakers,
+            max_speakers=args.max_speakers,
+        )
+        index_path = write_result_index(
+            output_root,
+            audio_root,
+            audio_files,
+            args.whisper_model,
+            args.pyannote_model,
+        )
+        print(f"\nProceso terminado. Índice: {index_path}")
+        if len(audio_files) == 1:
+            relative = audio_files[0].relative_to(audio_root)
+            final_path = (diarization_root / relative).with_suffix(".speakers.json")
+            print(f"Transcripción diarizada: {final_path}")
+        return 0
 
     if not args.skip_transcription:
         if args.transcription_engine == "mlx":

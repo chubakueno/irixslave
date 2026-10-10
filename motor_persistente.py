@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 SCRIPTS_ROOT = PACKAGE_ROOT / "scripts_originales"
@@ -102,7 +103,13 @@ class PersistentEngine:
                 pass
         print("  [motor persistente] modelos listos.", flush=True)
 
-    def prewarm(self, audio_path: Path, label: str | None = None):
+    def prewarm(
+        self,
+        audio_path: Path,
+        label: str | None = None,
+        *,
+        keep_audio_for_diarization: bool = False,
+    ):
         """Fase CPU de la transcripción (decode + VAD + collect_chunks + log-mel),
         para correrla por adelantado fuera del camino crítico de la GPU. Devuelve
         el dict que `process` pasará a transcribir.transcribe_one, o None si no
@@ -113,6 +120,7 @@ class PersistentEngine:
             prepared = fwb.prepare(
                 self.transcriber, str(audio_path),
                 vad_parameters={"min_silence_duration_ms": 700},
+                return_audio=keep_audio_for_diarization,
             )
             t = prepared["timings"]
             print(
@@ -134,6 +142,7 @@ class PersistentEngine:
         language: str,
         want_transcription: bool = True,
         want_diarization: bool = True,
+        audio_root: Path | None = None,
         num_speakers: int | None = None,
         min_speakers: int | None = None,
         max_speakers: int | None = None,
@@ -147,7 +156,7 @@ class PersistentEngine:
         if want_diarization and self.pipeline is None:
             raise RuntimeError("Se pidió diarización pero el motor no cargó Pyannote.")
 
-        audio_root = audio_path.parent
+        audio_root = audio_root or audio_path.parent
         transcript_root = out_dir / "transcripciones"
         diarization_root = out_dir / "diarizaciones"
         relative = audio_path.relative_to(audio_root)
@@ -169,6 +178,19 @@ class PersistentEngine:
 
         if want_diarization:
             print("  [motor persistente] diarizando...", flush=True)
+            diarization_waveform = None
+            if (
+                prepared_audio is not None
+                and prepared_audio.get("audio") is not None
+                and prepared_audio.get("sampling_rate") == diarizar.SAMPLE_RATE
+            ):
+                diarization_waveform = torch.from_numpy(
+                    prepared_audio["audio"]
+                ).unsqueeze(0)
+                print(
+                    "  [motor persistente] reutilizando decode para diarización.",
+                    flush=True,
+                )
             # diarizar.diarize_one alinea con el transcript si lo encuentra en
             # transcript_root; en jobs de solo-diarización no existe y produce
             # únicamente el .diarization.json.
@@ -183,6 +205,7 @@ class PersistentEngine:
                 num_speakers=num_speakers,
                 min_speakers=min_speakers,
                 max_speakers=max_speakers,
+                waveform=diarization_waveform,
             )
 
         def _load(path: Path) -> dict[str, Any] | None:

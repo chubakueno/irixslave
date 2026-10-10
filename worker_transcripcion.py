@@ -944,7 +944,11 @@ def main() -> int:
     def lease_and_prewarm() -> PreparedJob | None:
         job = prepare_job(cfg, args.live)
         if job is not None and prewarm and TRANSCRIPTION in job.requested_outputs:
-            job.prepared_audio = engine.prewarm(job.audio_path, label=job.job_id)
+            job.prepared_audio = engine.prewarm(
+                job.audio_path,
+                label=job.job_id,
+                keep_audio_for_diarization=DIARIZATION in job.requested_outputs,
+            )
         return job
 
     # El hilo de fondo `advance` hace lo que va entre jobs y no usa GPU: dispara

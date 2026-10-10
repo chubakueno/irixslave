@@ -45,6 +45,7 @@ def prepare(
     audio,
     *,
     vad_parameters: dict | None = None,
+    return_audio: bool = False,
 ) -> dict[str, Any]:
     """Fase CPU: decodifica (si hace falta), corre el VAD de Silero, agrupa en
     chunks de <=30 s (collect_chunks) y calcula el log-mel de cada chunk.
@@ -89,7 +90,7 @@ def prepare(
     )
     t_mel = _time.perf_counter()
 
-    return {
+    prepared = {
         "features": features,
         "chunks_metadata": chunks_metadata,
         "clip_timestamps": clip_timestamps,  # en muestras, como el camino interno
@@ -103,6 +104,9 @@ def prepare(
             "total": t_mel - t0,
         },
     }
+    if return_audio:
+        prepared["audio"] = audio
+    return prepared
 
 
 def generate(

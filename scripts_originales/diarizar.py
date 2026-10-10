@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -19,8 +20,10 @@ os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "false")
 import av
 import numpy as np
 import torch
+from einops import rearrange
 from huggingface_hub import get_token
 from pyannote.audio import Pipeline
+from pyannote.core import SlidingWindowFeature
 
 
 MODEL_ID = "pyannote/speaker-diarization-community-1"
@@ -360,6 +363,156 @@ def append_progress(path: Path, row: dict[str, Any]) -> None:
         writer.writerow(row)
 
 
+def enable_fast_embedding_cache(pipeline: Any) -> bool:
+    """Avoid recomputing WeSpeaker frame maps for every local speaker mask.
+
+    Pyannote Community-1 uses a WeSpeaker model whose forward pass can be split
+    into an expensive chunk-level `forward_frames` call and cheap mask-specific
+    `forward_embedding` calls. The stock pipeline calls the full model once per
+    (chunk, local speaker). This patch computes frame maps once per chunk and
+    reuses them for all local speaker masks. Outputs are numerically equivalent
+    for Community-1 in inference mode.
+    """
+
+    original_get_embeddings = getattr(pipeline, "get_embeddings", None)
+    if original_get_embeddings is None or getattr(pipeline, "_fast_embedding_cache", False):
+        return False
+
+    def get_embeddings_frame_cached(
+        file,
+        binary_segmentations: SlidingWindowFeature,
+        exclude_overlap: bool = False,
+        hook=None,
+    ):
+        if pipeline.training:
+            return original_get_embeddings(
+                file,
+                binary_segmentations,
+                exclude_overlap=exclude_overlap,
+                hook=hook,
+            )
+
+        embedding_model = getattr(getattr(pipeline, "_embedding", None), "model_", None)
+        can_cache_frames = (
+            embedding_model is not None
+            and hasattr(embedding_model, "forward_frames")
+            and hasattr(embedding_model, "forward_embedding")
+        )
+        if not can_cache_frames:
+            return original_get_embeddings(
+                file,
+                binary_segmentations,
+                exclude_overlap=exclude_overlap,
+                hook=hook,
+            )
+
+        duration = binary_segmentations.sliding_window.duration
+        num_chunks, num_frames, local_num_speakers = binary_segmentations.data.shape
+
+        if exclude_overlap:
+            min_num_samples = pipeline._embedding.min_num_samples
+            num_samples = duration * pipeline._embedding.sample_rate
+            min_num_frames = math.ceil(num_frames * min_num_samples / num_samples)
+            clean_frames = 1.0 * (
+                np.sum(binary_segmentations.data, axis=2, keepdims=True) < 2
+            )
+            clean_segmentations = SlidingWindowFeature(
+                binary_segmentations.data * clean_frames,
+                binary_segmentations.sliding_window,
+            )
+        else:
+            min_num_frames = -1
+            clean_segmentations = SlidingWindowFeature(
+                binary_segmentations.data,
+                binary_segmentations.sliding_window,
+            )
+
+        chunks = []
+        used_masks = []
+        active_masks = []
+
+        for (chunk, masks), (_, clean_masks) in zip(
+            binary_segmentations, clean_segmentations
+        ):
+            chunks.append(chunk)
+            masks = np.nan_to_num(masks, nan=0.0).astype(np.float32)
+            clean_masks = np.nan_to_num(clean_masks, nan=0.0).astype(np.float32)
+
+            chunk_masks = []
+            chunk_active = []
+            for mask, clean_mask in zip(masks.T, clean_masks.T):
+                if np.sum(clean_mask) > min_num_frames:
+                    used_mask = clean_mask
+                else:
+                    used_mask = mask
+
+                chunk_masks.append(used_mask)
+                chunk_active.append(np.sum(used_mask) > min_num_frames)
+
+            used_masks.append(np.stack(chunk_masks))
+            active_masks.append(np.asarray(chunk_active, dtype=bool))
+
+        chunk_batch_size = pipeline.embedding_batch_size
+        speaker_batch_size = pipeline.embedding_batch_size * local_num_speakers
+        batch_count = math.ceil(num_chunks / chunk_batch_size)
+        embedding_batches = []
+
+        if hook is not None:
+            hook("embeddings", None, total=batch_count, completed=0)
+
+        with torch.inference_mode():
+            for i, start in enumerate(range(0, num_chunks, chunk_batch_size), 1):
+                waveform_batch = []
+                for chunk in chunks[start : start + chunk_batch_size]:
+                    waveform, _ = pipeline._audio.crop(file, chunk, mode="pad")
+                    waveform_batch.append(waveform[None])
+
+                waveform_batch = torch.vstack(waveform_batch).to(pipeline._embedding.device)
+                frames = embedding_model.forward_frames(waveform_batch)
+                num_batch_chunks = frames.shape[0]
+
+                masks = torch.from_numpy(
+                    np.stack(used_masks[start : start + chunk_batch_size]).reshape(
+                        num_batch_chunks * local_num_speakers,
+                        -1,
+                    )
+                ).to(pipeline._embedding.device)
+
+                frames = (
+                    frames[:, None]
+                    .expand(num_batch_chunks, local_num_speakers, *frames.shape[1:])
+                    .reshape(num_batch_chunks * local_num_speakers, *frames.shape[1:])
+                )
+
+                speaker_embeddings = []
+                for embedding_start in range(0, frames.shape[0], speaker_batch_size):
+                    embedding_batch = embedding_model.forward_embedding(
+                        frames[embedding_start : embedding_start + speaker_batch_size],
+                        weights=masks[embedding_start : embedding_start + speaker_batch_size],
+                    )
+                    speaker_embeddings.append(embedding_batch.cpu().numpy())
+
+                embedding_batch = np.vstack(speaker_embeddings)
+                embedding_batch[
+                    ~np.stack(active_masks[start : start + chunk_batch_size]).reshape(-1)
+                ] = np.nan
+                embedding_batches.append(embedding_batch)
+
+                if hook is not None:
+                    hook("embeddings", embedding_batch, total=batch_count, completed=i)
+
+        embedding_batches = np.vstack(embedding_batches)
+        return rearrange(
+            embedding_batches,
+            "(c s) d -> c s d",
+            c=num_chunks,
+        )
+
+    pipeline.get_embeddings = get_embeddings_frame_cached
+    pipeline._fast_embedding_cache = True
+    return True
+
+
 def load_pipeline(
     model: str,
     cache_dir: Path,
@@ -405,6 +558,8 @@ def load_pipeline(
         cache_dir=cache_dir,
     )
     pipeline.to(device)
+    if enable_fast_embedding_cache(pipeline):
+        print("PYANNOTE_FAST_EMBEDDING_CACHE=enabled")
     if hasattr(pipeline, "segmentation_batch_size"):
         pipeline.segmentation_batch_size = segmentation_batch_size
     if hasattr(pipeline, "embedding_batch_size"):
@@ -425,6 +580,7 @@ def diarize_one(
     min_speakers: int | None = None,
     max_speakers: int | None = None,
     test_seconds: float | None = None,
+    waveform: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Diariza un solo audio con un pipeline ya cargado y escribe sus salidas.
     No atrapa excepciones: el llamador decide si continúa con el resto del lote."""
@@ -432,7 +588,11 @@ def diarize_one(
     output_base = output_root / relative_audio.with_suffix("")
     started = time.perf_counter()
 
-    waveform = load_audio(audio_path, test_seconds)
+    if waveform is None:
+        waveform = load_audio(audio_path, test_seconds)
+    elif test_seconds is not None:
+        max_samples = round(test_seconds * SAMPLE_RATE)
+        waveform = waveform[:, :max_samples]
     duration = waveform.shape[1] / SAMPLE_RATE
     uri = safe_uri(relative_audio)
     pipeline_input = {"waveform": waveform, "sample_rate": SAMPLE_RATE, "uri": uri}

@@ -81,6 +81,23 @@ brew install python@3.12
 ./instalar.sh   # también instala 'speech' (Homebrew) si falta
 ```
 
+### Linux + NVIDIA (ej. vast.ai)
+
+```bash
+./instalar_linux.sh   # o ./desplegar_worker.sh <host> <puerto> desde tu máquina
+```
+
+**Si `pip` muere con `Killed` / SIGKILL.** En una instancia de vast.ai (oct. 2026), `./.venv/bin/pip install --upgrade pip` y luego `python3.12 -m venv .venv` (su paso `ensurepip`) murieron con SIGKILL. No era memoria (`oom_kill 0` en `/sys/fs/cgroup/memory.events`, 87 GB libres), ni disco, ni `ulimit`. La causa no está confirmada: `/etc/vast-agents-guide.md` no menciona que maten procesos, aunque recomienda `uv pip install` y el entorno `/venv/main`. Alternativa sin pip ni `ensurepip`:
+
+```bash
+rm -rf .venv
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cu130 'torch==2.11.0+cu130' 'torchaudio==2.11.0+cu130'
+uv pip install --python .venv/bin/python -r requirements.txt
+```
+
+Antes de instalar torch, revise que `nvidia-smi` muestre `CUDA Version` ≥ 13.0 para `cu130`; si es menor, use el índice y el sufijo `+cuXXX` correspondientes.
+
 ### Ambas plataformas
 
 El instalador crea `.venv` y descarga las dependencias. No descarga todavía los pesos de Whisper ni Pyannote. Después, acepte las condiciones del modelo en:

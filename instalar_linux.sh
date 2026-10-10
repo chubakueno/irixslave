@@ -13,6 +13,8 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
 fi
 
 echo "Usando $("$PYTHON_BIN" --version) ($PYTHON_BIN)"
+# Si pip/ensurepip mueren con SIGKILL (visto en vast.ai, causa sin confirmar),
+# ver "Linux + NVIDIA" en README.md: instalar con uv en vez de pip.
 [ -d .venv ] || "$PYTHON_BIN" -m venv .venv
 ./.venv/bin/pip install --upgrade pip setuptools wheel
 
