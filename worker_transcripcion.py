@@ -5,6 +5,7 @@ import json
 import math
 import os
 import platform
+import signal
 import socket
 import subprocess
 import sys
@@ -66,7 +67,7 @@ def parse_capabilities(raw: str | None) -> list[str]:
 # Carpeta propia (en vez de %TEMP%) para los audios descargados por job. Así la
 # exclusión de Windows Defender puede apuntar a esta única carpeta en vez de a
 # todo %TEMP%, que comparten otros programas.
-WORKER_TMP_DIR = PACKAGE_ROOT / ".worker_tmp"
+WORKER_TMP_DIR = Path(os.environ.get("WORKER_TMP_DIR", str(PACKAGE_ROOT / ".worker_tmp")))
 
 sys.path.insert(0, str(PACKAGE_ROOT))
 from pipeline_transcripcion_diarizada import AUDIO_EXTENSIONS, nvidia_library_dirs  # noqa: E402
@@ -163,7 +164,7 @@ def load_config(
         default_diarization_engine = "soniqo"
         default_device = "cpu"
     else:
-        default_worker_id = f"worker-{socket.gethostname()}"
+        default_worker_id = f"worker-{os.environ.get('RUNPOD_POD_ID') or socket.gethostname()}"
         default_transcription_engine = "faster-whisper"
         default_whisper_model = "large-v3"
         default_diarization_engine = "pyannote"
@@ -181,8 +182,8 @@ def load_config(
         diarization_engine=getenv(env_file, "DIARIZATION_ENGINE", default_diarization_engine),
         device=getenv(env_file, "DEVICE", default_device),
         language=getenv(env_file, "TRANSCRIPTION_LANGUAGE", "es"),
-        models_dir=PACKAGE_ROOT / "modelos",
-        results_dir=PACKAGE_ROOT / "resultados_worker",
+        models_dir=Path(getenv(env_file, "MODELS_DIR", str(PACKAGE_ROOT / "modelos"))),
+        results_dir=Path(getenv(env_file, "RESULTS_DIR", str(PACKAGE_ROOT / "resultados_worker"))),
         # Vacío => se deriva por dispositivo (int8_float16 en CUDA, int8 en CPU).
         compute_type=getenv(env_file, "COMPUTE_TYPE", ""),
         whisper_batch_size=int(getenv(env_file, "WHISPER_BATCH_SIZE", "12")),
@@ -891,6 +892,14 @@ def main() -> int:
     cfg = load_config(args.poll_interval, capabilities_override)
     print(f"Capacidades del worker: {', '.join(cfg.capabilities)}")
 
+    stop_requested = threading.Event()
+
+    def request_stop(signum: int, frame: Any) -> None:
+        print("SIGTERM recibido: terminando trabajos reservados y subidas en curso.", flush=True)
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+
     engine = None
     if args.persistent_models:
         if cfg.transcription_engine != "faster-whisper" or cfg.diarization_engine != "pyannote":
@@ -927,7 +936,6 @@ def main() -> int:
             load_pyannote=load_pyannote,
         )
 
-    stop_requested = threading.Event()
     key_watcher: StopKeyWatcher | None = None
     if not args.once:
         key_watcher = StopKeyWatcher(stop_requested)
@@ -1032,7 +1040,7 @@ def main() -> int:
                         drain_uploads()
                         return 0
                     drain_uploads(timeout=0.0)  # recoge las que ya terminaron
-                    time.sleep(cfg.poll_interval)
+                    stop_requested.wait(cfg.poll_interval)
                     continue
 
             # Asegura que `advance` esté trayendo el sucesor de `current` mientras

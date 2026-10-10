@@ -1,0 +1,24 @@
+FROM nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
+    PATH=/opt/venv/bin:$PATH \
+    HF_HOME=/workspace/huggingface MODELS_DIR=/workspace/modelos \
+    RESULTS_DIR=/workspace/resultados_worker WORKER_TMP_DIR=/workspace/worker_tmp \
+    DEVICE=cuda TRANSCRIPTION_ENGINE=faster-whisper DIARIZATION_ENGINE=pyannote
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-venv ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3.12 -m venv /opt/venv
+WORKDIR /opt/irixslave
+COPY requirements.txt ./
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install --index-url https://download.pytorch.org/whl/cu130 \
+        torch==2.11.0+cu130 torchaudio==2.11.0+cu130 \
+    && pip install -r requirements.txt
+COPY worker_transcripcion.py pipeline_transcripcion_diarizada.py motor_persistente.py ./
+COPY scripts_originales/ ./scripts_originales/
+COPY runpod_entrypoint.py ./
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["python", "runpod_entrypoint.py"]
+CMD ["--live", "--persistent-models"]

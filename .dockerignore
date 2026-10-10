@@ -1,0 +1,10 @@
+# Lista de inclusión: los tokens, modelos y audios nunca entran al contexto.
+**
+!Dockerfile.runpod
+!requirements.txt
+!worker_transcripcion.py
+!pipeline_transcripcion_diarizada.py
+!motor_persistente.py
+!runpod_entrypoint.py
+!scripts_originales/
+!scripts_originales/*.py

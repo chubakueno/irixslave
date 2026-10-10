@@ -379,6 +379,62 @@ Ninguno cambia la configuración de energía del sistema de forma permanente —
 
 Nota: la ruta Windows (RTX 4060 o similar) no se probó en una máquina real durante el desarrollo — la lógica multiplataforma se revisó por inspección de código, no con una corrida real en Windows/CUDA.
 
+## Lanzamiento automático en RunPod
+
+La imagen `Dockerfile.runpod` arranca el worker de polling directamente, en modo
+**LIVE** y con `--persistent-models`: descarga modelos, toma trabajos de la cola
+existente y sube resultados sin SSH ni instalación manual. Es para **Pods GPU**,
+no para la cola Serverless de RunPod. Utiliza CUDA 13.0 y las mismas versiones
+de PyTorch y dependencias que `instalar_linux.sh`.
+
+1. Construye y publica la imagen en tu registro (sustituye la ruta y etiqueta):
+
+   ```bash
+   docker build --platform linux/amd64 -f Dockerfile.runpod -t tuusuario/irixslave:runpod-v1 .
+   docker push tuusuario/irixslave:runpod-v1
+   ```
+
+   El contexto Docker incluye únicamente el código necesario; excluye `.env`,
+   modelos, resultados y audios. Para un registro privado, configura su credencial
+   en RunPod y pasa `--registry-id` al lanzador.
+
+2. Completa `.env` con `RUNPOD_API_KEY`, `RADIO_API_TOKEN` y `HF_TOKEN`.
+   El token HF debe tener acceso al modelo Pyannote y sus condiciones aceptadas.
+   También puedes exportar las variables: tienen prioridad sobre `.env`.
+
+3. Revisa la petición y luego crea el Pod:
+
+   ```bash
+   python lanzar_runpod.py --image tuusuario/irixslave:runpod-v1
+   python lanzar_runpod.py --image tuusuario/irixslave:runpod-v1 --create
+   ```
+
+   La primera orden muestra la configuración con tokens ocultos. `--create`
+   hace una única petición a la [API v2 de RunPod](https://www.runpod.io/blog/runpods-rest-api-v2-is-here-one-api-for-your-entire-gpu-stack)
+   y devuelve el ID del Pod; puede usarse desde scripts o CI. No reintenta la
+   creación automáticamente para evitar duplicados si se pierde la respuesta.
+   La clave RunPod queda en la máquina que lanza; solo se envían al Pod las
+   variables del worker. Cada Pod obtiene un worker ID propio.
+
+Por defecto solicita una RTX 4090, nube SECURE, disco de contenedor de 30 GB y
+volumen de 40 GB en `/workspace`. Ajusta con `--gpu`, `--cloud`, `--disk-gb` y
+`--volume-gb`. Usa `--capabilities transcription` para cargar únicamente Whisper
+(no requiere HF_TOKEN). Para reutilizar modelos entre Pods, pasa
+`--network-volume-id ID --data-center-id ID`; un volumen de Pod normal se pierde
+al eliminar el Pod. Los resultados y cachés también se guardan en `/workspace`.
+
+Los logs aparecen en la consola RunPod. SIGTERM solicita que el worker termine
+los trabajos ya reservados y las subidas antes de salir; el tiempo de gracia del
+proveedor puede limitar esta espera. El Pod permanece activo cuando no hay
+trabajos: deténlo o elimínalo desde RunPod para dejar de consumir GPU. Este
+lanzador no implementa autoscaling ni apagado por inactividad.
+
+Para ejecutar la imagen localmente o cambiar las opciones de arranque:
+
+```bash
+docker run --rm --gpus all --env-file .env -v irixslave-workspace:/workspace tuusuario/irixslave:runpod-v1 --once --live --persistent-models
+```
+
 ## Verificación del paquete
 
 Esta comprobación no descarga modelos ni procesa audio:
