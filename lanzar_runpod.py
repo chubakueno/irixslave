@@ -19,6 +19,9 @@ WORKER_ENV_KEYS = (
     "PYANNOTE_EMBEDDING_BATCH_SIZE",
 )
 SECRET_KEYS = {"RADIO_API_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
+# La imagen usa CUDA 12.8; RunPod filtra por versión exacta del driver, así que se
+# listan todas las que pueden ejecutarla.
+ALLOWED_CUDA_VERSIONS = ["12.8", "12.9", "13.0", "13.1", "13.2"]
 
 
 def api_error_detail(exc: HTTPError, env: dict[str, str]) -> str:
@@ -27,7 +30,7 @@ def api_error_detail(exc: HTTPError, env: dict[str, str]) -> str:
         raw = exc.read(16384).decode("utf-8", errors="replace")
     except OSError:
         return "No se pudo leer el detalle del rechazo."
-    for key in SECRET_KEYS | {"RUNPOD_API_KEY"}:
+    for key in SECRET_KEYS | {"RUNPOD_API_KEY", "VAST_API_KEY", "REGISTRY_PASSWORD"}:
         secret = env.get(key)
         if secret:
             raw = raw.replace(secret, "***")
@@ -69,7 +72,7 @@ def build_payload(args: argparse.Namespace, env: dict[str, str]) -> dict:
         "name": args.name,
         "image": args.image,
         "gpu": {"id": args.gpu, "count": args.gpu_count,
-                "allowedCudaVersions": ["13.0"]},
+                "allowedCudaVersions": ALLOWED_CUDA_VERSIONS},
         "cloud": args.cloud,
         "disk": args.disk_gb,
         "startSsh": False,

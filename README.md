@@ -384,14 +384,16 @@ Nota: la ruta Windows (RTX 4060 o similar) no se probó en una máquina real dur
 La imagen `Dockerfile.runpod` arranca el worker de polling directamente, en modo
 **LIVE** y con `--persistent-models`: descarga modelos, toma trabajos de la cola
 existente y sube resultados sin SSH ni instalación manual. Es para **Pods GPU**,
-no para la cola Serverless de RunPod. Utiliza CUDA 13.0 y las mismas versiones
-de PyTorch y dependencias que `instalar_linux.sh`.
+no para la cola Serverless de RunPod. Utiliza CUDA 12.8 (driver ≥ 570), con lo que
+corre en casi todo el inventario de RunPod y Vast.ai, incluidas las RTX 4090 y
+las GPUs Blackwell; las dependencias son las de `instalar_linux.sh`, salvo PyTorch
+`+cu128` en vez de `+cu130`.
 
 1. Construye y publica la imagen en tu registro (sustituye la ruta y etiqueta):
 
    ```bash
-   docker build --platform linux/amd64 -f Dockerfile.runpod -t tuusuario/irixslave:runpod-v1 .
-   docker push tuusuario/irixslave:runpod-v1
+   docker build --platform linux/amd64 -f Dockerfile.runpod -t tuusuario/irixslave:runpod-cu128 .
+   docker push tuusuario/irixslave:runpod-cu128
    ```
 
    El contexto Docker incluye únicamente el código necesario; excluye `.env`,
@@ -405,8 +407,8 @@ de PyTorch y dependencias que `instalar_linux.sh`.
 3. Revisa la petición y luego crea el Pod:
 
    ```bash
-   python lanzar_runpod.py --image tuusuario/irixslave:runpod-v1
-   python lanzar_runpod.py --image tuusuario/irixslave:runpod-v1 --create
+   python lanzar_runpod.py --image tuusuario/irixslave:runpod-cu128
+   python lanzar_runpod.py --image tuusuario/irixslave:runpod-cu128 --create
    ```
 
    La primera orden muestra la configuración con tokens ocultos. `--create`
@@ -432,8 +434,48 @@ lanzador no implementa autoscaling ni apagado por inactividad.
 Para ejecutar la imagen localmente o cambiar las opciones de arranque:
 
 ```bash
-docker run --rm --gpus all --env-file .env -v irixslave-workspace:/workspace tuusuario/irixslave:runpod-v1 --once --live --persistent-models
+docker run --rm --gpus all --env-file .env -v irixslave-workspace:/workspace tuusuario/irixslave:runpod-cu128 --once --live --persistent-models
 ```
+
+## Lanzamiento automático en Vast.ai
+
+La misma imagen de `Dockerfile.runpod` sirve en Vast.ai. A diferencia de RunPod,
+Vast.ai alquila máquinas concretas de un marketplace: `lanzar_vast.py` busca la
+oferta on-demand más barata que cumpla los filtros y la alquila con
+`runtype=args`, de modo que el `ENTRYPOINT` de la imagen arranca el worker en
+modo **LIVE** con `--persistent-models`.
+
+1. Construye y publica la imagen igual que para RunPod (paso 1 de la sección anterior).
+2. Completa `.env` con `VAST_API_KEY`, `RADIO_API_TOKEN` y `HF_TOKEN`. Si la
+   imagen es privada, añade `REGISTRY_USERNAME` y `REGISTRY_PASSWORD` (y
+   `--registry-host` si no es Docker Hub).
+3. Revisa las ofertas y luego alquila:
+
+   ```bash
+   python lanzar_vast.py --image tuusuario/irixslave:runpod-cu128
+   python lanzar_vast.py --image tuusuario/irixslave:runpod-cu128 --create
+   ```
+
+   La primera orden muestra la petición con secretos ocultos y las cinco mejores
+   ofertas (buscar es gratis y no requiere API key). `--create` alquila la primera; si Vast.ai
+   responde que la oferta ya no está disponible, prueba la siguiente (máximo 3).
+   Si la respuesta se pierde (timeout), no reintenta: revisa la consola antes de
+   repetir para no pagar dos instancias. `--offer-id ID` alquila una oferta concreta.
+
+Por defecto acepta, en este orden de preferencia, 1× RTX 4070S, RTX 4070S Ti
+(16 GB), RTX 4070 Ti o RTX 4070; dentro de cada modelo elige la más barata. En la
+web de Vast.ai la 4070S Ti aparece truncada como "RTX 4070S...". Además exige host verificado,
+CUDA ≥ 12.8, fiabilidad ≥ 0.95, bajada ≥ 200 Mbps y 70 GB de disco. `--gpu` recibe
+la lista en orden de preferencia con los nombres de Vast.ai, p. ej.
+`--gpu "RTX 4070S,RTX 4070 Ti,RTX 4070"`. Ajusta también con `--gpu-count`,
+`--max-price` (USD/h), `--min-reliability`, `--min-download-mbps` y `--disk-gb`.
+El worker ID se toma de `VAST_CONTAINERLABEL`, así que cada instancia tiene uno propio.
+
+Todo (modelos, resultados, cachés) vive en el disco de la instancia bajo
+`/workspace`: sobrevive a detener la instancia pero se pierde al destruirla.
+Una instancia detenida sigue cobrando almacenamiento. Los logs se ven en la
+consola de Vast.ai o con `vastai logs ID`. Igual que en RunPod, no hay
+autoscaling ni apagado por inactividad: destruye la instancia al terminar.
 
 ## Verificación del paquete
 

@@ -164,7 +164,9 @@ def load_config(
         default_diarization_engine = "soniqo"
         default_device = "cpu"
     else:
-        default_worker_id = f"worker-{os.environ.get('RUNPOD_POD_ID') or socket.gethostname()}"
+        default_worker_id = "worker-" + (os.environ.get("RUNPOD_POD_ID")
+                                         or os.environ.get("VAST_CONTAINERLABEL")
+                                         or socket.gethostname())
         default_transcription_engine = "faster-whisper"
         default_whisper_model = "large-v3"
         default_diarization_engine = "pyannote"

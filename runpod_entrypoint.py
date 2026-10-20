@@ -1,4 +1,4 @@
-"""Valida el entorno del Pod y reemplaza PID 1 por el worker."""
+"""Valida el entorno del contenedor (RunPod o Vast.ai) y reemplaza PID 1 por el worker."""
 from __future__ import annotations
 
 import os
@@ -8,7 +8,7 @@ import sys
 
 def main() -> None:
     if not os.environ.get("RADIO_API_TOKEN"):
-        raise SystemExit("Falta RADIO_API_TOKEN en las variables del Pod.")
+        raise SystemExit("Falta RADIO_API_TOKEN en las variables del contenedor.")
     capabilities = os.environ.get("WORKER_CAPABILITIES", "transcription,diarization")
     if "--transcription-only" in sys.argv:
         capabilities = "transcription"
@@ -32,7 +32,7 @@ def main() -> None:
         import torch
 
         if not torch.cuda.is_available():
-            raise SystemExit("CUDA no está disponible: este contenedor necesita un Pod con GPU NVIDIA.")
+            raise SystemExit("CUDA no está disponible: este contenedor necesita una GPU NVIDIA.")
         print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
     worker = Path(__file__).with_name("worker_transcripcion.py")
     os.execv(sys.executable, [sys.executable, "-u", str(worker), *sys.argv[1:]])
