@@ -34,12 +34,16 @@ python.org no tiene sus certificados. Pide al usuario que ejecute
 - **No reintentes un `--create` que falló por timeout o sin ID de instancia**
   ("Revisa la consola antes de repetir"): podría haber creado una instancia.
   Pide al usuario que revise https://cloud.vast.ai/instances/.
-- Si no se indica la imagen (`--image`), pregúntala. No inventes una etiqueta.
+- Imagen por defecto: `chubakueno/irixslave:runpod-cu128` (CUDA 12.8, privada en
+  Docker Hub; el pull usa `REGISTRY_USERNAME`/`REGISTRY_PASSWORD` del `.env`).
+  Usa otra solo si el usuario la pide. Si es `runpod-v1` (CUDA 13.0), el
+  launcher solo filtra CUDA ≥ 12.8: elige una oferta con CUDA ≥ 13.0 del listado
+  y alquílala con `--offer-id`.
 
 ## Listar ofertas
 
 ```bash
-python3 vast_launcher/lanzar_vast.py --env-file .env --image <imagen>
+python3 vast_launcher/lanzar_vast.py --env-file .env --image chubakueno/irixslave:runpod-cu128
 ```
 
 Muestra la petición (secretos como `***`) y hasta 5 ofertas, ordenadas por
@@ -67,7 +71,7 @@ Siempre se exige host verificado, on-demand y CUDA ≥ 12.8.
 Tras la confirmación del usuario, usa los mismos flags que en el listado y agrega `--create`:
 
 ```bash
-python3 vast_launcher/lanzar_vast.py --env-file .env --image <imagen> [filtros] --create
+python3 vast_launcher/lanzar_vast.py --env-file .env --image chubakueno/irixslave:runpod-cu128 [filtros] --create
 ```
 
 Alquila la primera oferta; si ya no está disponible prueba la siguiente (máx. 3).
