@@ -493,7 +493,7 @@ autoscaling ni apagado por inactividad: destruye la instancia al terminar.
 se publica como repo aparte con `git subtree split`; ver
 [vast_launcher/README.md](vast_launcher/README.md). Su lista de variables del
 worker (`WORKER_ENV_KEYS`) duplica la de `lanzar_runpod.py`: si agregas una,
-actualiza ambas.
+actualiza ambas. Desde Claude Code, `/vast` lista ofertas y lanza instancias.
 
 ## Verificación del paquete
 
