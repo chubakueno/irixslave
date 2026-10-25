@@ -33,7 +33,17 @@ def main() -> None:
 
         if not torch.cuda.is_available():
             raise SystemExit("CUDA no está disponible: este contenedor necesita una GPU NVIDIA.")
-        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+        free, total = torch.cuda.mem_get_info(0)
+        print(f"GPU: {torch.cuda.get_device_name(0)} ({free / 2**30:.1f} GB libres de {total / 2**30:.1f} GB)",
+              flush=True)
+        # Algunos hosts (sobre todo en Vast.ai) entregan la GPU con VRAM ya ocupada
+        # por otro proceso; mejor un mensaje claro que un OOM al cargar Whisper.
+        min_free_gb = float(os.environ.get("MIN_FREE_VRAM_GB", "6"))
+        if free / 2**30 < min_free_gb:
+            raise SystemExit(
+                f"GPU ocupada por otro proceso: solo {free / 2**30:.1f} GB libres "
+                f"(se necesitan {min_free_gb:g}). Destruye la instancia y excluye esa máquina."
+            )
     worker = Path(__file__).with_name("worker_transcripcion.py")
     os.execv(sys.executable, [sys.executable, "-u", str(worker), *sys.argv[1:]])
 
