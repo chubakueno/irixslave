@@ -115,6 +115,20 @@ class VastLauncherTests(unittest.TestCase):
         self.assertNotIn("api-secret", errors)
         self.assertNotIn("radio-secret", errors)
 
+    @patch.dict(os.environ, {"VAST_API_KEY": "key", "RADIO_API_TOKEN": "token",
+                            "VAST_EXCLUDE_MACHINES": "7, 8"}, clear=True)
+    def test_excluded_machines_are_filtered_in_query_and_ranking(self):
+        offers = {"offers": [{**offer, "machine_id": offer["id"] - 99} for offer in OFFERS["offers"]]}
+        replies = [response(offers), response({"success": True, "new_contract": 557})]
+        with patch.object(launcher, "urlopen", side_effect=replies) as call:
+            result, _, _ = self.run_launcher("--create", "--capabilities", "transcription",
+                                             "--exclude-machine", "2")
+        self.assertEqual(result, 0)
+        query = json.loads(call.call_args_list[0].args[0].data)
+        self.assertEqual(query["machine_id"], {"notin": [2, 7, 8]})
+        # La 101 (máquina 2) se descarta aunque la API la devuelva: se alquila la 102.
+        self.assertTrue(call.call_args.args[0].full_url.endswith("/asks/102/"))
+
     @patch.dict(os.environ, {"VAST_API_KEY": "key", "RADIO_API_TOKEN": "token"}, clear=True)
     def test_explicit_offer_skips_search(self):
         with patch.object(launcher, "urlopen",

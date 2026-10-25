@@ -34,9 +34,15 @@ def gpu_preference(raw: str) -> list[str]:
     return names
 
 
-def rank_offers(offers: list[dict], gpus: list[str]) -> list[dict]:
+def machine_ids(raw: str) -> set[int]:
+    """IDs de máquina separados por comas (VAST_EXCLUDE_MACHINES)."""
+    return {int(item) for item in raw.replace(" ", "").split(",") if item}
+
+
+def rank_offers(offers: list[dict], gpus: list[str], excluded: set[int] | frozenset[int] = frozenset()) -> list[dict]:
     """Primero la GPU más deseable; dentro de cada modelo, la más barata."""
-    return sorted((offer for offer in offers if offer.get("gpu_name") in gpus),
+    return sorted((offer for offer in offers
+                   if offer.get("gpu_name") in gpus and offer.get("machine_id") not in excluded),
                   key=lambda offer: (gpus.index(offer["gpu_name"]), offer.get("dph_total", 0)))
 
 
@@ -53,6 +59,8 @@ def build_query(args: argparse.Namespace) -> dict:
     }
     if args.max_price:
         query["dph_total"] = {"lte": args.max_price}
+    if args.exclude_machine:
+        query["machine_id"] = {"notin": sorted(args.exclude_machine)}
     return query
 
 
@@ -75,7 +83,8 @@ def build_instance(args: argparse.Namespace, env: dict[str, str]) -> dict:
 
 
 def describe(offer: dict) -> str:
-    return (f"oferta {offer.get('id')}: {offer.get('num_gpus')}x {offer.get('gpu_name')} "
+    return (f"oferta {offer.get('id')} (máquina {offer.get('machine_id', '?')}): "
+            f"{offer.get('num_gpus')}x {offer.get('gpu_name')} "
             f"${offer.get('dph_total', 0):.3f}/h, CUDA {offer.get('cuda_max_good')}, "
             f"fiabilidad {offer.get('reliability', 0):.3f}, {offer.get('geolocation', '?')}")
 
@@ -92,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-reliability", type=float, default=0.95)
     parser.add_argument("--min-download-mbps", type=positive_int, default=200)
     parser.add_argument("--offer-id", type=int, help="Alquila esta oferta en vez de buscar la más barata.")
+    parser.add_argument("--exclude-machine", type=positive_int, action="append", default=[],
+                        help="No alquilar esta máquina (repetible). Se suma a VAST_EXCLUDE_MACHINES del .env.")
     parser.add_argument("--registry-host", default="docker.io",
                         help="Registro para REGISTRY_USERNAME/REGISTRY_PASSWORD (imagen privada).")
     parser.add_argument("--capabilities", choices=("transcription", "diarization", "transcription,diarization"),
@@ -101,6 +112,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Alquila la instancia (facturable). Sin esta opción solo muestra ofertas y la petición.")
     args = parser.parse_args(argv)
     env = read_env(args.env_file)
+    try:
+        args.exclude_machine = set(args.exclude_machine) | machine_ids(env.get("VAST_EXCLUDE_MACHINES", ""))
+    except ValueError:
+        parser.error("VAST_EXCLUDE_MACHINES debe ser una lista de IDs numéricos separados por comas.")
     instance = build_instance(args, env)
     api_key = env.get("VAST_API_KEY", "")
     if api_key.startswith("reemplaza_"):
@@ -126,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             # Buscar ofertas es de solo lectura: un fallo aquí no crea nada.
             found = call_api("POST", "/bundles/", api_key, build_query(args)).get("offers") or []
-            offers = rank_offers(found, args.gpu)
+            offers = rank_offers(found, args.gpu, args.exclude_machine)
         except HTTPError as exc:
             print(f"Vast.ai rechazó la búsqueda (HTTP {exc.code}).", file=sys.stderr)
             print(f"Detalle: {api_error_detail(exc, env)}", file=sys.stderr)
