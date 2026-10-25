@@ -1,4 +1,8 @@
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+# Variante CUDA: por defecto 12.8 (driver >= 570). Para CUDA 13.0 (driver >= 580):
+#   docker build --build-arg CUDA_IMAGE=13.0.2 --build-arg TORCH_CUDA=cu130 ...
+ARG CUDA_IMAGE=12.8.1
+FROM nvidia/cuda:${CUDA_IMAGE}-cudnn-runtime-ubuntu24.04
+ARG TORCH_CUDA=cu128
 
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
     PATH=/opt/venv/bin:$PATH \
@@ -12,13 +16,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python3.12 -m venv /opt/venv
 WORKDIR /opt/irixslave
 COPY requirements.txt ./
-# torchcodec de PyPI está compilado contra CUDA 13; se sustituye por el build
-# cu128 que corresponde a torch 2.11 (torchcodec 0.11 <-> torch 2.11).
+# torchcodec se instala desde el índice de PyTorch con la misma variante CUDA
+# que torch y en la versión que le corresponde (torchcodec 0.11 <-> torch 2.11);
+# el de PyPI está compilado contra CUDA 13 y para otra versión de torch.
 RUN pip install --upgrade pip setuptools wheel \
-    && grep -v '^torchcodec' requirements.txt > /tmp/requirements-cu128.txt \
-    && pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
-        torch==2.11.0+cu128 torchaudio==2.11.0+cu128 torchcodec==0.11.1+cu128 \
-        -r /tmp/requirements-cu128.txt
+    && grep -v '^torchcodec' requirements.txt > /tmp/requirements-docker.txt \
+    && pip install --extra-index-url https://download.pytorch.org/whl/${TORCH_CUDA} \
+        torch==2.11.0+${TORCH_CUDA} torchaudio==2.11.0+${TORCH_CUDA} torchcodec==0.11.1+${TORCH_CUDA} \
+        -r /tmp/requirements-docker.txt
 COPY worker_transcripcion.py pipeline_transcripcion_diarizada.py motor_persistente.py ./
 COPY scripts_originales/ ./scripts_originales/
 COPY runpod_entrypoint.py ./

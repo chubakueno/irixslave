@@ -396,6 +396,18 @@ las GPUs Blackwell; las dependencias son las de `instalar_linux.sh`, salvo PyTor
    docker push tuusuario/irixslave:runpod-cu128
    ```
 
+   La misma receta genera la variante CUDA 13.0 (driver ≥ 580), publicada como
+   `runpod-v1`:
+
+   ```bash
+   docker build --platform linux/amd64 -f Dockerfile.runpod \
+     --build-arg CUDA_IMAGE=13.0.2 --build-arg TORCH_CUDA=cu130 -t tuusuario/irixslave:runpod-v1 .
+   docker push tuusuario/irixslave:runpod-v1
+   ```
+
+   Con `runpod-v1`, lanza en RunPod solo GPUs cuyos hosts tengan CUDA ≥ 13.0;
+   `lanzar_runpod.py` admite desde 12.8.
+
    El contexto Docker incluye únicamente el código necesario; excluye `.env`,
    modelos, resultados y audios. Para un registro privado, configura su credencial
    en RunPod y pasa `--registry-id` al lanzador.
