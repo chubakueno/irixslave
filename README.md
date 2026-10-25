@@ -452,7 +452,7 @@ docker run --rm --gpus all --env-file .env -v irixslave-workspace:/workspace tuu
 ## Lanzamiento automático en Vast.ai
 
 La misma imagen de `Dockerfile.runpod` sirve en Vast.ai. A diferencia de RunPod,
-Vast.ai alquila máquinas concretas de un marketplace: `lanzar_vast.py` busca la
+Vast.ai alquila máquinas concretas de un marketplace: `vast_launcher/lanzar_vast.py` busca la
 oferta on-demand más barata que cumpla los filtros y la alquila con
 `runtype=args`, de modo que el `ENTRYPOINT` de la imagen arranca el worker en
 modo **LIVE** con `--persistent-models`.
@@ -464,8 +464,8 @@ modo **LIVE** con `--persistent-models`.
 3. Revisa las ofertas y luego alquila:
 
    ```bash
-   python lanzar_vast.py --image tuusuario/irixslave:runpod-cu128
-   python lanzar_vast.py --image tuusuario/irixslave:runpod-cu128 --create
+   python vast_launcher/lanzar_vast.py --env-file .env --image tuusuario/irixslave:runpod-cu128
+   python vast_launcher/lanzar_vast.py --env-file .env --image tuusuario/irixslave:runpod-cu128 --create
    ```
 
    La primera orden muestra la petición con secretos ocultos y las cinco mejores
@@ -488,6 +488,12 @@ Todo (modelos, resultados, cachés) vive en el disco de la instancia bajo
 Una instancia detenida sigue cobrando almacenamiento. Los logs se ven en la
 consola de Vast.ai o con `vastai logs ID`. Igual que en RunPod, no hay
 autoscaling ni apagado por inactividad: destruye la instancia al terminar.
+
+`vast_launcher/` es autónomo (sin dependencias ni imports del resto del repo) y
+se publica como repo aparte con `git subtree split`; ver
+[vast_launcher/README.md](vast_launcher/README.md). Su lista de variables del
+worker (`WORKER_ENV_KEYS`) duplica la de `lanzar_runpod.py`: si agregas una,
+actualiza ambas.
 
 ## Verificación del paquete
 

@@ -3,17 +3,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import re
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-
-from lanzar_runpod import SECRET_KEYS, WORKER_ENV_KEYS, api_error_detail, positive_int, read_env
 
 API_BASE = "https://console.vast.ai/api/v0"
 WORKER_ARGS = ["--live", "--persistent-models"]
 # Rechazos que garantizan que no se creó nada y la oferta ya no sirve: se prueba la siguiente.
 OFFER_UNAVAILABLE = {400, 404, 409, 410}
+WORKER_ENV_KEYS = (
+    "RADIO_BASE_URL", "RADIO_API_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN",
+    "WHISPER_MODEL", "PYANNOTE_MODEL", "TRANSCRIPTION_LANGUAGE",
+    "POLL_INTERVAL_SECONDS", "HEARTBEAT_INTERVAL_SECONDS", "COMPUTE_TYPE",
+    "WHISPER_BATCH_SIZE", "PYANNOTE_SEGMENTATION_BATCH_SIZE",
+    "PYANNOTE_EMBEDDING_BATCH_SIZE",
+)
+SECRET_KEYS = {"RADIO_API_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}
 
 
 def call_api(method: str, path: str, api_key: str, body: dict) -> dict:
@@ -24,6 +32,47 @@ def call_api(method: str, path: str, api_key: str, body: dict) -> dict:
     request = Request(f"{API_BASE}{path}", data=json.dumps(body).encode(), method=method, headers=headers)
     with urlopen(request, timeout=90) as response:
         return json.load(response)
+
+
+def api_error_detail(exc: HTTPError, env: dict[str, str]) -> str:
+    """Recupera el motivo del rechazo sin imprimir credenciales reflejadas."""
+    try:
+        raw = exc.read(16384).decode("utf-8", errors="replace")
+    except OSError:
+        return "No se pudo leer el detalle del rechazo."
+    for key in SECRET_KEYS | {"VAST_API_KEY", "REGISTRY_PASSWORD"}:
+        secret = env.get(key)
+        if secret:
+            raw = raw.replace(secret, "***")
+            raw = raw.replace(json.dumps(secret)[1:-1], "***")
+    raw = re.sub(r"(?:dckr_pat_|hf_)[A-Za-z0-9_-]+", "***", raw)
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        detail = body.get("detail") or body.get("message") or body.get("error") or body.get("title")
+        raw = json.dumps(detail, ensure_ascii=False) if detail is not None else raw
+    # Una respuesta HTML de un proxy también ayuda a distinguirla de la API.
+    return " ".join(raw.split())[:2000] or "La API no devolvió un motivo."
+
+
+def read_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if path.is_file():
+        for raw in path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip().strip('"').strip("'")
+    return {**values, **os.environ}
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("Debe ser mayor que cero.")
+    return number
 
 
 def gpu_preference(raw: str) -> list[str]:
