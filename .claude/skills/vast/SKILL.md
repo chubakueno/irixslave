@@ -10,6 +10,15 @@ dependencias, sin GPU ni venv del worker). Ejecuta siempre desde la raíz del re
 y con `--env-file .env`, porque el `.env` está en la raíz, no junto al script.
 Usa `python3` si `python` no existe, como en macOS.
 
+Si la consulta falla con un error DNS (`socket.gaierror`, `nodename nor servname
+provided`, `Name or service not known`) dentro de un sandbox con red restringida,
+puede ser una restricción del entorno. En Codex, repite la consulta de solo
+lectura con `sandbox_permissions="require_escalated"` y una `justification`
+que solicite acceso a la API pública de Vast. No cambies credenciales ni
+desactives TLS para resolver este error. Si también falla con acceso autorizado,
+reporta el error sin dar por confirmada su causa. Esto no autoriza reintentar
+un `--create` de resultado incierto; aplica la regla de creación indicada abajo.
+
 Si falla con `CERTIFICATE_VERIFY_FAILED` en macOS, el Python instalado desde
 python.org no tiene sus certificados. Pide al usuario que ejecute
 `/Applications/Python 3.x/Install Certificates.command`.
