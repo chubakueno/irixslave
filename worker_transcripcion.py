@@ -177,7 +177,7 @@ def load_config(
         token=getenv(env_file, "RADIO_API_TOKEN", required=True),
         worker_id=getenv(env_file, "WORKER_ID", default_worker_id),
         poll_interval=poll_interval,
-        heartbeat_interval=float(getenv(env_file, "HEARTBEAT_INTERVAL_SECONDS", "30")),
+        heartbeat_interval=float(getenv(env_file, "HEARTBEAT_INTERVAL_SECONDS", "18")),
         whisper_model=getenv(env_file, "WHISPER_MODEL", default_whisper_model),
         transcription_engine=getenv(env_file, "TRANSCRIPTION_ENGINE", default_transcription_engine),
         pyannote_model=getenv(env_file, "PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1"),
@@ -231,24 +231,57 @@ def send_heartbeat(session: requests.Session, cfg: Config, job_id: str, lease_id
     resp.raise_for_status()
 
 
+# Errores de red pasajeros (corte TCP/SSL, timeout, respuesta truncada) y
+# estados HTTP que indican sobrecarga momentánea. Un 4xx como 409 no se
+# reintenta: repetir la misma petición no lo arregla.
+TRANSIENT_ERRORS = (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError)
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+
+
+def post_with_retry(session: requests.Session, url: str, delays: tuple[float, ...], label: str,
+                    **kwargs: Any) -> requests.Response:
+    """POST que reintenta tras cada espera de `delays` si el fallo es pasajero.
+    Con delays=(2, 5, 15) hace hasta 4 intentos en ~22 s más los timeouts."""
+    for attempt, delay in enumerate((*delays, None), start=1):
+        try:
+            resp = session.post(url, **kwargs)
+            if resp.status_code not in TRANSIENT_STATUS or delay is None:
+                resp.raise_for_status()
+                return resp
+            reason: Exception | str = f"HTTP {resp.status_code}"
+        except TRANSIENT_ERRORS as exc:
+            if delay is None:
+                raise
+            reason = exc
+        print(f"  [{label}] intento {attempt} falló ({reason}); reintento en {delay:.0f}s", file=sys.stderr)
+        time.sleep(delay)
+    raise AssertionError("inalcanzable")
+
+
 def complete_job(session: requests.Session, cfg: Config, job_id: str, lease_id: str, payload: dict[str, Any]) -> None:
-    resp = session.post(
+    # Si un intento llegó al servidor pero se perdió la respuesta, el
+    # reintento puede recibir 409 aunque el resultado ya se haya aceptado.
+    post_with_retry(
+        session,
         job_action_url(cfg, job_id, "complete"),
+        delays=(2, 5, 15),
+        label=f"{job_id} complete",
         headers=api_headers(cfg, lease_id),
         json=payload,
         timeout=60,
     )
-    resp.raise_for_status()
 
 
 def fail_job(session: requests.Session, cfg: Config, job_id: str, lease_id: str, error: str, retryable: bool) -> None:
-    resp = session.post(
+    post_with_retry(
+        session,
         job_action_url(cfg, job_id, "fail"),
+        delays=(2, 5),
+        label=f"{job_id} fail",
         headers=api_headers(cfg, lease_id),
         json={"error": error, "retryable": retryable},
         timeout=30,
     )
-    resp.raise_for_status()
 
 
 class HeartbeatThread(threading.Thread):
@@ -262,12 +295,18 @@ class HeartbeatThread(threading.Thread):
         self._stop = threading.Event()
 
     def run(self) -> None:
-        while not self._stop.wait(self._interval):
+        # Tras un fallo se reintenta a los pocos segundos en vez de esperar el
+        # intervalo completo: con ~60 s sin heartbeat el servidor ya dio un
+        # lease por abandonado (409 en adelante).
+        wait = self._interval
+        while not self._stop.wait(wait):
             try:
                 send_heartbeat(self._session, self._cfg, self._job_id, self._lease_id)
                 print(f"  [{self._job_id}] heartbeat OK")
+                wait = self._interval
             except Exception as exc:
                 print(f"  [{self._job_id}] [heartbeat ERROR: {exc}]", file=sys.stderr)
+                wait = min(5.0, self._interval)
 
     def stop(self) -> None:
         self._stop.set()
