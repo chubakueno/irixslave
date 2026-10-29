@@ -11,3 +11,4 @@ __pycache__/
 *.pid
 HF_TOKEN
 .env
+.vast-controller/
